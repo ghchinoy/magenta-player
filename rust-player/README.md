@@ -22,6 +22,11 @@ prompt = "ambient lofi chords with acoustic guitar"
 temperature = 1.3
 topk = 40
 midi_gate = false
+cfg_text = 3.0     # CFG weight for the style prompt (higher = more adherent, less natural)
+cfg_notes = 5.0    # CFG weight for MIDI note conditioning
+cfg_drums = 1.0    # CFG weight for drum conditioning (try 0.0 with drumless=false for softer drums)
+drumless = false   # Suppress drums entirely, independent of the style prompt
+volume_db = 0.0    # Output gain in dB (0.0 = unity gain)
 ```
 
 > **⚠️ `resources` is required for `--prompt` to have any effect.** It points at the
@@ -47,6 +52,29 @@ Launches real-time audio streaming.
 
 # Overrides the default prompt and temperature for this run only
 ./target/release/magenta-rust-player play --prompt "lofi jazz piano" --temperature 1.1
+
+# Drumless ambient pad, dialed-down drum CFG, quieter output for this run only
+./target/release/magenta-rust-player play --drumless true --cfg-drums 0.0 --volume-db=-6.0
+```
+
+> **Note:** Negative numeric values (e.g. a negative `--volume-db`) must use the `=` form —
+> `--volume-db=-6.0` — not `--volume-db -6.0`, otherwise clap mistakes `-6.0` for a flag.
+> The same applies to `config set volume_db -6.0`, which works fine since it's a positional arg.
+
+#### `play` Flag Reference
+```text
+  -m, --model <MODEL_PATH>          Path to the model directory or .mlxfn file
+  -r, --resources <RESOURCES_PATH>  Path to the assets/resources directory
+  -p, --prompt <PROMPT>             Text style conditioning prompt
+  -t, --temperature <TEMPERATURE>   Generation temperature (scales randomness)
+  -k, --topk <TOPK>                 Top-K sampling (restricts likely choices)
+  -g, --midi-gate <MIDI_GATE>       Enable low-latency MIDI gate envelope [true|false]
+      --cfg-text <CFG_TEXT>         CFG weight for the text/style prompt. Factory default: 3.0
+      --cfg-notes <CFG_NOTES>       CFG weight for MIDI note conditioning. Factory default: 5.0
+      --cfg-drums <CFG_DRUMS>       CFG weight for drum conditioning. Factory default: 1.0
+      --drumless <DRUMLESS>         Suppress drums entirely, independent of the style prompt [true|false]
+      --volume-db <VOLUME_DB>       Output gain in dB (0.0 = unity gain)
+  -h, --help                        Print help
 ```
 
 ### 2. The `config` Subcommand
@@ -64,9 +92,16 @@ Inspects and modifies your saved defaults.
 ./target/release/magenta-rust-player config set temperature 1.1
 ./target/release/magenta-rust-player config set model "/path/to/mrt2_base/mrt2_base.mlxfn"
 
+# Tune CFG weights, drums, and volume as persistent defaults
+./target/release/magenta-rust-player config set cfg_text 4.0
+./target/release/magenta-rust-player config set drumless true
+./target/release/magenta-rust-player config set volume_db -6.0
+
 # Clear the default model path from config
 ./target/release/magenta-rust-player config set model none
 ```
+
+**Valid `config set` keys**: `model`, `resources`, `prompt`, `temperature`, `topk`, `midi_gate`, `cfg_text`, `cfg_notes`, `cfg_drums`, `drumless`, `volume_db`.
 
 ---
 

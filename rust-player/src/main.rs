@@ -21,6 +21,11 @@ mod ffi {
         fn set_top_k(self: Pin<&mut RealtimeRunnerBridge>, k: u32);
         fn set_midi_gate(self: Pin<&mut RealtimeRunnerBridge>, enabled: bool);
         fn set_buffer_size(self: Pin<&mut RealtimeRunnerBridge>, cap: usize);
+        fn set_cfg_text(self: Pin<&mut RealtimeRunnerBridge>, v: f32);
+        fn set_cfg_notes(self: Pin<&mut RealtimeRunnerBridge>, v: f32);
+        fn set_cfg_drums(self: Pin<&mut RealtimeRunnerBridge>, v: f32);
+        fn set_drumless(self: Pin<&mut RealtimeRunnerBridge>, on: bool);
+        fn set_volume_db(self: Pin<&mut RealtimeRunnerBridge>, v: f32);
         fn toggle_play(self: &RealtimeRunnerBridge, playing: bool);
         fn get_quantizer_status(self: &RealtimeRunnerBridge) -> i32;
         fn read_audio_stereo(
@@ -45,6 +50,16 @@ struct AppConfig {
     temperature: f32,
     topk: u32,
     midi_gate: bool,
+    /// CFG weight for the text/style prompt (MusicCoCa). Higher = more adherent to the prompt.
+    cfg_text: f32,
+    /// CFG weight for MIDI note conditioning.
+    cfg_notes: f32,
+    /// CFG weight for drum conditioning.
+    cfg_drums: f32,
+    /// Suppress drums entirely, independent of the style prompt.
+    drumless: bool,
+    /// Output gain in dB (0.0 = unity gain / no change).
+    volume_db: f32,
 }
 
 impl Default for AppConfig {
@@ -56,6 +71,12 @@ impl Default for AppConfig {
             temperature: 1.3,
             topk: 40,
             midi_gate: false,
+            // Match the C++ engine's own factory defaults (mlx_engine.cpp).
+            cfg_text: 3.0,
+            cfg_notes: 5.0,
+            cfg_drums: 1.0,
+            drumless: false,
+            volume_db: 0.0,
         }
     }
 }
@@ -106,31 +127,51 @@ enum Commands {
     Config(ConfigArgs),
 }
 
-#[derive(ClapArgs, Debug)]
+#[derive(ClapArgs, Debug, Default)]
 struct PlayArgs {
     /// Path to the model directory or .mlxfn file
-    #[arg(short, long, value_name = "MODEL_PATH")]
+    #[arg(short = 'm', long, value_name = "MODEL_PATH")]
     model: Option<PathBuf>,
 
     /// Path to the assets/resources directory
-    #[arg(short, long, value_name = "RESOURCES_PATH")]
+    #[arg(short = 'r', long, value_name = "RESOURCES_PATH")]
     resources: Option<String>,
 
     /// Text style conditioning prompt
-    #[arg(short, long)]
+    #[arg(short = 'p', long)]
     prompt: Option<String>,
 
     /// Generation temperature (scales randomness)
-    #[arg(short, long)]
+    #[arg(short = 't', long)]
     temperature: Option<f32>,
 
     /// Top-K sampling (restricts likely choices)
-    #[arg(short, long)]
+    #[arg(short = 'k', long)]
     topk: Option<u32>,
 
     /// Enable low-latency MIDI gate envelope
-    #[arg(short, long)]
+    #[arg(short = 'g', long)]
     midi_gate: Option<bool>,
+
+    /// CFG weight for the text/style prompt (higher = more adherent to prompt). Factory default: 3.0
+    #[arg(long)]
+    cfg_text: Option<f32>,
+
+    /// CFG weight for MIDI note conditioning. Factory default: 5.0
+    #[arg(long)]
+    cfg_notes: Option<f32>,
+
+    /// CFG weight for drum conditioning. Factory default: 1.0
+    #[arg(long)]
+    cfg_drums: Option<f32>,
+
+    /// Suppress drums entirely, independent of the style prompt
+    #[arg(long)]
+    drumless: Option<bool>,
+
+    /// Output gain in dB (0.0 = unity gain). Use --volume-db=-6.0 syntax for negative values.
+    #[arg(long, allow_hyphen_values = true)]
+    volume_db: Option<f32>,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -149,10 +190,12 @@ enum ConfigAction {
     
     /// Modify a specific configuration value (e.g. config set prompt \"jazz\")
     Set {
-        /// Configuration key to modify (model, resources, prompt, temperature, topk, midi_gate)
+        /// Configuration key to modify (model, resources, prompt, temperature, topk, midi_gate,
+        /// cfg_text, cfg_notes, cfg_drums, drumless, volume_db)
         key: String,
         
-        /// New value for the configuration key
+        /// New value for the configuration key (negative numbers OK, e.g. -6.0)
+        #[arg(allow_hyphen_values = true)]
         value: String,
     },
 }
@@ -215,9 +258,49 @@ fn main() {
                                 std::process::exit(1);
                             }
                         }
+                        "cfg_text" => {
+                            if let Ok(val) = value.parse::<f32>() {
+                                config.cfg_text = val;
+                            } else {
+                                eprintln!("❌ Error: Failed to parse cfg_text as float");
+                                std::process::exit(1);
+                            }
+                        }
+                        "cfg_notes" => {
+                            if let Ok(val) = value.parse::<f32>() {
+                                config.cfg_notes = val;
+                            } else {
+                                eprintln!("❌ Error: Failed to parse cfg_notes as float");
+                                std::process::exit(1);
+                            }
+                        }
+                        "cfg_drums" => {
+                            if let Ok(val) = value.parse::<f32>() {
+                                config.cfg_drums = val;
+                            } else {
+                                eprintln!("❌ Error: Failed to parse cfg_drums as float");
+                                std::process::exit(1);
+                            }
+                        }
+                        "drumless" => {
+                            if let Ok(val) = value.parse::<bool>() {
+                                config.drumless = val;
+                            } else {
+                                eprintln!("❌ Error: Failed to parse drumless as boolean (true/false)");
+                                std::process::exit(1);
+                            }
+                        }
+                        "volume_db" => {
+                            if let Ok(val) = value.parse::<f32>() {
+                                config.volume_db = val;
+                            } else {
+                                eprintln!("❌ Error: Failed to parse volume_db as float");
+                                std::process::exit(1);
+                            }
+                        }
                         _ => {
                             eprintln!("❌ Error: Unknown configuration key '{}'", key);
-                            eprintln!("Valid keys: model, resources, prompt, temperature, topk, midi_gate");
+                            eprintln!("Valid keys: model, resources, prompt, temperature, topk, midi_gate, cfg_text, cfg_notes, cfg_drums, drumless, volume_db");
                             std::process::exit(1);
                         }
                     }
@@ -231,14 +314,7 @@ fn main() {
         }
         None => {
             // Default to play with default arguments if no subcommand is supplied
-            run_player(config, PlayArgs {
-                model: None,
-                resources: None,
-                prompt: None,
-                temperature: None,
-                topk: None,
-                midi_gate: None,
-            });
+            run_player(config, PlayArgs::default());
         }
     }
 }
@@ -261,12 +337,20 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     let temperature = args.temperature.unwrap_or(config.temperature);
     let topk = args.topk.unwrap_or(config.topk);
     let midi_gate = args.midi_gate.unwrap_or(config.midi_gate);
+    let cfg_text = args.cfg_text.unwrap_or(config.cfg_text);
+    let cfg_notes = args.cfg_notes.unwrap_or(config.cfg_notes);
+    let cfg_drums = args.cfg_drums.unwrap_or(config.cfg_drums);
+    let drumless = args.drumless.unwrap_or(config.drumless);
+    let volume_db = args.volume_db.unwrap_or(config.volume_db);
 
     println!("=== Magenta RealTime 2 Rust Player CLI ===");
     println!("Prompt:      \"{}\"", prompt);
     println!("Temperature: {}", temperature);
     println!("Top-K:       {}", topk);
     println!("MIDI Gate:   {}", if midi_gate { "Enabled" } else { "Disabled" });
+    println!("CFG (text/notes/drums): {:.1} / {:.1} / {:.1}", cfg_text, cfg_notes, cfg_drums);
+    println!("Drumless:    {}", drumless);
+    println!("Volume:      {:.1} dB", volume_db);
     println!("Resources:   {}", resources_path);
     if let Some(ref path) = model_path {
         println!("Model Path:  {}", path);
@@ -297,6 +381,11 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     runner_unique.pin_mut().set_temperature(temperature);
     runner_unique.pin_mut().set_top_k(topk);
     runner_unique.pin_mut().set_midi_gate(midi_gate);
+    runner_unique.pin_mut().set_cfg_text(cfg_text);
+    runner_unique.pin_mut().set_cfg_notes(cfg_notes);
+    runner_unique.pin_mut().set_cfg_drums(cfg_drums);
+    runner_unique.pin_mut().set_drumless(drumless);
+    runner_unique.pin_mut().set_volume_db(volume_db);
     
     // Set ring buffer virtual capacity to 4096 samples (2 frames at 48kHz) 
     // as per best practices in docs/realtime-audio.md to absorb GPU scheduling jitter

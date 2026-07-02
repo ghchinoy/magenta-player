@@ -62,6 +62,30 @@ public:
         runner_->set_buffer_size(cap);
     }
 
+    // CFG (classifier-free guidance) weights control how strongly each
+    // conditioning signal steers generation. Higher = more strongly
+    // adherent to that signal, at some cost to naturalness/diversity.
+    // Factory defaults: text=3.0, notes=5.0, drums=1.0.
+    void set_cfg_text(float v) {
+        runner_->set_cfg_musiccoca(v);
+    }
+
+    void set_cfg_notes(float v) {
+        runner_->set_cfg_notes(v);
+    }
+
+    void set_cfg_drums(float v) {
+        runner_->set_cfg_drums(v);
+    }
+
+    void set_drumless(bool on) {
+        runner_->set_drumless(on);
+    }
+
+    void set_volume_db(float v) {
+        runner_->set_volume_db(v);
+    }
+
     void toggle_play(bool playing) const {
         auto* r = const_cast<magentart::core::RealtimeRunner*>(runner_.get());
         r->set_bypass(!playing);
