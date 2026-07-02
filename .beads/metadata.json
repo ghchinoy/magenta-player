@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "magenta_player",
+  "project_id": "84edafab-c670-4325-a92a-a8eb22ad1e6c"
+}
