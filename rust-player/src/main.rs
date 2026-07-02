@@ -387,10 +387,15 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     runner_unique.pin_mut().set_drumless(drumless);
     runner_unique.pin_mut().set_volume_db(volume_db);
     
-    // Set ring buffer virtual capacity to 4096 samples (2 frames at 48kHz) 
-    // as per best practices in docs/realtime-audio.md to absorb GPU scheduling jitter
-    println!("Configuring C++ ring buffer size to 4096 samples...");
-    runner_unique.pin_mut().set_buffer_size(4096);
+    // Set ring buffer virtual capacity to 8192 samples (RingBuffer::kCapacity, the
+    // physical maximum, ~170ms/4 frames at 48kHz). docs/realtime-audio.md and
+    // mrt2-prompt-and-drift.md both call out that 4096 (~85ms) still allows
+    // occasional underruns on mrt2_base due to Metal scheduling jitter (50-80ms/frame
+    // observed on borderline hardware); 8192 absorbs that variance. This only fixes
+    // *jitter*-caused drops -- if dropped_frames still grows unbounded, that's a
+    // genuine hardware throughput limit no buffer size can fix (switch to mrt2_small).
+    println!("Configuring C++ ring buffer size to 8192 samples (max, ~170ms headroom)...");
+    runner_unique.pin_mut().set_buffer_size(8192);
 
     // 4. Load the model if provided:
     if let Some(ref path_str) = model_path {

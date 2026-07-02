@@ -30,6 +30,20 @@ Metal kernel scheduling still causes occasional underruns. 8192 eliminates
 them. For a generative music tool, the extra ~85 ms of latency is
 imperceptible.
 
+**Measured (Rust/CPAL, Apple M5 base tier, 32GB, magenta-player-iii.6):** `mrt2_small`
+is rock-stable at both 4096 and 8192 — transformer 13–23 ms/frame, dropped_frames
+pins at the single startup-priming frame and never grows again at 8192. `mrt2_base`
+measured 57–74 ms/frame (vs the 40 ms budget) at **both** buffer sizes, with
+dropped_frames growing linearly and unboundedly in both cases (~55–70/2s-tick at
+4096, ~76–87/2s-tick at 8192) — confirming this specific machine is genuinely
+throughput-bound for `mrt2_base`, not jitter-bound; 8192 changed nothing for it, as
+the docs' own caveat predicts. Notably this is a **base-tier M5**, newer than the
+M1 Pro reference case above but without Pro/Max-class memory bandwidth — the
+"M1 Pro and above" real-time guidance for `mrt2_base` should probably be read as
+"Pro/Max tier and above, any generation" rather than a strict chip-generation cutoff.
+Kept 8192 as the new default regardless: strictly better for `mrt2_small`, neutral
+(no worse) for `mrt2_base`.
+
 ## Startup Priming
 
 When `start()` is called the ring buffer is **empty**. `AVAudioSourceNode`
