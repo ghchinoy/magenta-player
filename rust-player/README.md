@@ -6,46 +6,67 @@ It utilizes Google DeepMind's underlying C++ inference engine (`magentart::core`
 
 ---
 
-## 🚀 Getting Started & Build Workflows
+## 📂 XDG Configuration Support (Viper-style)
 
-You can compile and run the Rust player using the root-level orchestrator or through the local directory Makefile.
+The player supports persistent configuration settings stored in your platform's standard XDG configuration folder:
+* **macOS Path**: `~/Library/Application Support/magenta-rust-player/config.toml`
+* **Linux Path**: `~/.config/magenta-rust-player/config.toml`
 
-### Option A: From the Monorepo Root (Recommended)
-Before building the player, compile the C++ core library and export its headers once:
-```bash
-# Compile shared MRT2 static library and populate headers
-make build-mrt2
+When launching the player with no arguments (simply running `./target/release/magenta-rust-player`), it will **automatically** load your saved default configuration—including the model path—meaning you only need to configure it once!
 
-# Compile the Rust player release binary
-make build-rust
+### Standard `config.toml` Format:
+```toml
+model = "/Users/username/Documents/Magenta/magenta-rt-v2/models/mrt2_small/mrt2_small.mlxfn"
+resources = "~/Documents/Magenta/magenta-rt-v2/resources"
+prompt = "ambient lofi chords with acoustic guitar"
+temperature = 1.3
+topk = 40
+midi_gate = false
 ```
-This outputs the fully optimized release binary at `rust-player/target/release/magenta-rust-player`.
+
+> **⚠️ `resources` is required for `--prompt` to have any effect.** It points at the
+> MusicCoCa tokenizer/text-encoder/quantizer assets (`init_assets()`), loaded separately
+> from the model weights. If this path is wrong, the player will print a warning on
+> startup and silently fall back to the model's default style prompt (a piano loop) no
+> matter what `--prompt` you pass. See `docs/realtime-audio.md` for details.
 
 ---
 
-### Option B: Local Directory Development
-If you are developing inside the `rust-player/` directory, a local `Makefile` is provided to wrap standard Cargo development workflows:
+## 🛠️ CLI Subcommands & Usage
 
+The Rust player supports declarative, Cobra-like subcommands using `clap`. Any command-line arguments passed to the `play` subcommand will dynamically override your saved `config.toml` defaults for that run.
+
+### 1. The `play` Subcommand
+Launches real-time audio streaming.
 ```bash
-cd rust-player
+# Starts playback using your config.toml defaults
+./target/release/magenta-rust-player
 
-# 1. Setup local Python/MLX dependencies
-make setup
+# Same as above, but explicit
+./target/release/magenta-rust-player play
 
-# 2. Build the player in release mode (requires mrt2-build/ completed)
-make build
-
-# 3. Compile and run immediately with default settings
-make run
+# Overrides the default prompt and temperature for this run only
+./target/release/magenta-rust-player play --prompt "lofi jazz piano" --temperature 1.1
 ```
 
-#### Available Local Makefile Targets:
-* `make build` — Compiles the Rust player and FFI bridge in release mode (`cargo build --release`).
-* `make run` — Builds and runs the CLI with a default prompt style.
-* `make test` — Runs all Rust-side unit and integration tests (`cargo test`).
-* `make lint` — Checks code formatting (`cargo fmt`) and runs static analysis lints (`cargo clippy`).
-* `make dev` — Launches in hot-reload mode (requires `cargo watch` installed).
-* `make clean` — Cleans Cargo targets and build cache.
+### 2. The `config` Subcommand
+Inspects and modifies your saved defaults.
+
+```bash
+# View the path and contents of your active config.toml
+./target/release/magenta-rust-player config list
+
+# Print only the absolute file path to config.toml
+./target/release/magenta-rust-player config path
+
+# Modify a specific parameter in your config file permanently
+./target/release/magenta-rust-player config set prompt "ambient chill step synthesizer"
+./target/release/magenta-rust-player config set temperature 1.1
+./target/release/magenta-rust-player config set model "/path/to/mrt2_base/mrt2_base.mlxfn"
+
+# Clear the default model path from config
+./target/release/magenta-rust-player config set model none
+```
 
 ---
 
@@ -63,17 +84,19 @@ To test the player, first ensure you have downloaded the MRT2 model sizes using 
 ### 1. Test with the Small Model (`mrt2_small`)
 This model is highly responsive, lightweight, and runs comfortably on all Apple Silicon chips (including base MacBooks and Airs). 
 ```bash
-./target/release/magenta-rust-player \
+./target/release/magenta-rust-player play \
   --model ~/Documents/Magenta/magenta-rt-v2/models/mrt2_small/mrt2_small.mlxfn \
   --prompt "ambient lofi chords with acoustic guitar" \
   --temperature 1.3
 ```
-*Note: The RVQ vocoder in the 230M model size has an inherent slightly warbly or "grainy" texture, which is a normal characteristic of the model's small footprint.*
+*Note 1: The RVQ vocoder in the 230M model size has an inherent slightly warbly or "grainy" texture, which is a normal characteristic of the model's small footprint.*
+
+*Note 2: If you are using external speakers (like Sonos Roam or Bluetooth) that lock to 44.1 kHz instead of 48 kHz, the player will show a warning. It will fall back to 44.1 kHz, which causes a minor pitch-shift and conversion warble. For pristine sound, use built-in MBP speakers set to 48,000 Hz in macOS Audio MIDI Setup.*
 
 ### 2. Test with the Larger Base Model (`mrt2_base`)
 For high-fidelity continuations with a full frequency spectrum and clean sound (removing the smaller model's vocoder warble), load the 2.4B base model:
 ```bash
-./target/release/magenta-rust-player \
+./target/release/magenta-rust-player play \
   --model ~/Documents/Magenta/magenta-rt-v2/models/mrt2_base/mrt2_base.mlxfn \
   --prompt "smooth electric piano chords, rhodes, 90s jazz vibes, clean" \
   --temperature 1.2
@@ -82,49 +105,44 @@ For high-fidelity continuations with a full frequency spectrum and clean sound (
 
 ---
 
-## 🛠️ CLI Options & Parameters
+## 🚀 Getting Started & Build Workflows
 
-Customize your real-time generation using these flags:
+You can compile the Rust player using the root-level orchestrator or through the local directory Makefile.
 
-```text
-Options:
-  -m, --model <MODEL_PATH>          Path to the model directory or .mlxfn file
-  -r, --resources <RESOURCES_PATH>  Path to assets/resources directory [default: ~/Documents/Magenta/magenta-rt-v2/resources]
-  -p, --prompt <PROMPT>             Text style conditioning prompt [default: "ambient lofi chords with acoustic guitar"]
-  -t, --temperature <TEMPERATURE>   Generation temperature (scales randomness) [default: 1.3]
-  -t, --topk <TOPK>                 Top-K token sampling (restricts unlikely choices) [default: 40]
-  -m, --midi-gate                   Enable low-latency MIDI gate envelope (only sounds while notes are held)
-  -h, --help                        Print help
-  -V, --version                     Print version
+### Option A: From the Monorepo Root (Recommended)
+Before building the player, compile the C++ core library and export its headers once:
+```bash
+# Compile shared MRT2 static library and populate headers
+make build-mrt2
+
+# Compile the Rust player release binary
+make build-rust
+```
+This outputs the fully optimized release binary at `rust-player/target/release/magenta-rust-player`.
+
+### Option B: Local Directory Development
+If you are developing inside the `rust-player/` directory, a local `Makefile` is provided to wrap standard Cargo development workflows:
+
+```bash
+cd rust-player
+
+# 1. Setup local Python/MLX dependencies
+make setup
+
+# 2. Build the player in release mode (requires mrt2-build/ completed)
+make build
+
+# 3. Compile and run immediately with default settings
+make run
 ```
 
 ---
 
 ## 🧠 Technical Architecture
 
-The safe, zero-overhead FFI bridge is declared in `src/main.rs`:
-```rust
-#[cxx::bridge]
-mod ffi {
-    unsafe extern "C++" {
-        include!("magenta-rust-player/src/bridge.h");
+The FFI boundary and CPAL real-time stream integration is declared natively inside `src/main.rs`.
 
-        type RealtimeRunnerBridge;
-
-        fn create_runner() -> UniquePtr<RealtimeRunnerBridge>;
-        fn load_model(self: Pin<&mut RealtimeRunnerBridge>, path: &str) -> bool;
-        fn set_prompt(self: Pin<&mut RealtimeRunnerBridge>, prompt: &str);
-        fn set_temperature(self: Pin<&mut RealtimeRunnerBridge>, temp: f32);
-        fn set_top_k(self: Pin<&mut RealtimeRunnerBridge>, k: u32);
-        fn set_midi_gate(self: Pin<&mut RealtimeRunnerBridge>, enabled: bool);
-        fn toggle_play(self: Pin<&mut RealtimeRunnerBridge>, playing: bool);
-        fn read_audio_stereo(self: &RealtimeRunnerBridge, dest_l: &mut [f32], dest_r: &mut [f32]) -> bool;
-        fn read_metrics(self: &RealtimeRunnerBridge) -> String;
-    }
-}
-```
-
-The matching `src/bridge.h` compiles directly alongside the Rust crate. It routes stereo samples from C++ ring buffers into the **CPAL audio thread** using a completely lock-free, zero-mutex pipeline to ensure audio dropouts never occur during MLX GPU tensor calculations.
+The C++ bridge in `src/bridge.h` compiles directly alongside the Rust crate. It routes stereo samples from C++ ring buffers into the **CPAL audio thread** using a completely lock-free, zero-mutex pipeline, ensuring that intensive MLX GPU tensor calculations never block the real-time audio output.
 
 ---
 

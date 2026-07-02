@@ -15,18 +15,20 @@ Metal GPU scheduling jitter easily exceeds 2.7 ms, causing underruns.
 audio/silence sounds like **wobble or warping**, not the obvious clicks you
 might expect from a dropout.
 
-**Fix:** set `virtual_capacity` to at least **4096 samples (~85 ms = 2 frames)**
-before calling `start()`. This absorbs GPU scheduling variance on both
-`mrt2_small` and `mrt2_base`.
+**Fix:** set `virtual_capacity` to **8192 samples (~170 ms = 4 frames)** before
+calling `start()`. This is the physical maximum and absorbs GPU scheduling
+variance on both `mrt2_small` and `mrt2_base`.
 
 ```swift
-magentart_set_buffer_size(ref, 4096)
+magentart_set_buffer_size(ref, 8192)
 magentart_start(ref)
 ```
 
-Maximum physical capacity is `RingBuffer::kCapacity = 8192` samples (~170 ms).
-Higher values increase latency; 4096 is the stable sweet spot for interactive
-use.
+`mrt2_base` inference on borderline hardware (M1 Pro) can consume 50–80 ms per
+frame. With only 4096 samples (~85 ms = 2 frames) of headroom, variance in
+Metal kernel scheduling still causes occasional underruns. 8192 eliminates
+them. For a generative music tool, the extra ~85 ms of latency is
+imperceptible.
 
 ## Startup Priming
 
@@ -66,6 +68,42 @@ matches `read_audio_stereo(float* destL, float* destR, ...)` directly. Do not
 use an interleaved format — you will need to de-interleave manually or the
 stereo image will be corrupted.
 
+## Output Sample Rate: 48 kHz vs 44.1 kHz
+
+MRT2 produces audio strictly at **48,000 Hz**. Many external Bluetooth and
+network speakers (e.g. Sonos Roam) are hardware-locked to **44,100 Hz**.
+
+### Swift player (`AVAudioEngine`)
+
+`AVAudioEngine` handles sample rate conversion **automatically and
+transparently** when the hardware output rate differs from the format you
+requested. If you configure the source node at 48 kHz and the device runs at
+44.1 kHz, `AVAudioEngine` resamples internally — no pitch shift, no manual
+intervention required. This is not a concern for the Swift player.
+
+For the cleanest signal path (zero SRC), open macOS **Audio MIDI Setup** and
+set the output device to exactly **48,000 Hz** stereo. This is optional but
+eliminates any resampling artefacts entirely.
+
+### Rust player (CPAL / direct device access)
+
+CPAL writes directly to whatever sample rate the hardware device exposes.
+If the device reports 44.1 kHz and you write 48 kHz content without resampling:
+
+- **Pitch and speed shift**: 48 kHz frames played back at 44.1 kHz run at
+  `44100 / 48000 = 91.875%` speed — a noticeable flat pitch shift.
+- **Interpolation artefacts**: On-the-fly resampling without a proper
+  anti-aliasing filter produces aliasing and filter ringing, which can sound
+  like a subtle warble or harmonic distortion (distinct from a ring-buffer
+  dropout).
+
+**Fixes for the Rust player:**
+- Query the device's preferred sample rate via CPAL before starting the
+  stream; warn the user if it differs from 48 kHz.
+- Implement a high-quality resampler (e.g. libsamplerate / rubberband) in
+  the audio render callback when `device_rate != 48_000`.
+- See `magenta-player-3vy.2` (bd issue) for the tracked implementation task.
+
 ## Audio Engine Setup Must Happen Before Playback
 
 `setupAudioEngine()` is **not** called automatically. If you create a
@@ -91,6 +129,52 @@ for i in 0..<n { sum += pL[i] * pL[i] }
 let rms = sqrtf(sum / Float(n))
 let dBFS = rms > 0 ? 20 * log10(rms) : -Float.infinity
 ```
+
+## init_assets() Is Required Before Prompts Work — Silent Failure Otherwise
+
+`RealtimeRunner::set_text_prompts()` / `set_prompt()` only *schedules* a
+background encode via `fetch_musiccoca_tokens()`. That function bails out
+immediately — silently — if the tokenizer, text-encoder, or quantizer TFLite
+interpreters aren't loaded:
+
+```cpp
+if (!tokenizer_ || !text_encoder_interpreter_ || !quantizer_interpreter_ || ...) {
+    text_encoder_status_ = 3;  // error
+    quantizer_status_ = 3;     // error
+    return;
+}
+```
+
+Those interpreters are populated by **`init_assets(resource_dir)`** /
+**`load_musiccoca_model(resource_dir, subfolder)`** — a separate lifecycle
+call from `load_model()` (which only loads the MLX transformer weights).
+**Nothing calls `init_assets` for you automatically.**
+
+If you skip it: `set_prompt()` appears to succeed (no exception, no return
+value to check), but `musiccoca_tokens_` never leaves its hardcoded
+`kDefaultMusicCoCaTokensPiano` value (see `mlx_engine.cpp`), no matter what
+blend weights you set or what order you call things in. **You will hear the
+default piano prompt forever**, regardless of the prompt text you send.
+
+**Fix:** call `init_assets(resources_dir)` once, right after constructing the
+runner and *before* the first `set_prompt()` / `load_model()` call. Check its
+return value — a `false` means your resources path is wrong.
+
+```cpp
+runner->init_assets(resources_dir);   // loads tokenizer/text-encoder/quantizer
+runner->set_prompt("lofi jazz piano");
+runner->load_model(mlxfn_path);
+```
+
+**Verifying it worked:** watch stdout for `[MagentaRT] Combined Prompt (N)
+tokens: ...` with token values that change per-prompt. If you only ever see
+the model's default piano tokens, `init_assets` did not succeed.
+
+**Closing the last race:** even with `init_assets` done, encoding is
+asynchronous (`fetch_musiccoca_tokens` runs on a detached thread). Poll
+`get_quantizer_status()` (0=idle, 1=fetching, 2=success, 3=error) after
+`set_prompt()`/`load_model()` and don't unmute audio / open the output stream
+until it reports `2`, to guarantee zero default-prompt bleed on startup.
 
 ## Threading Model
 

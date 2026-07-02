@@ -18,6 +18,10 @@ cpal = "0.15"
 # Safe, fast bidirectional C++ FFI interop
 cxx = "1.0"
 
+# Cross-platform directories (XDG config)
+dirs = "5.0"
+toml = "0.8"
+
 # Audio level utilities and standard serialization/logging
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
