@@ -104,6 +104,35 @@ If the device reports 44.1 kHz and you write 48 kHz content without resampling:
   the audio render callback when `device_rate != 48_000`.
 - See `magenta-player-3vy.2` (bd issue) for the tracked implementation task.
 
+## Bypass-as-Pause: Implementing Pause Without Stopping Inference
+
+`set_bypass(true)` silences the output while the inference thread keeps
+running. This is the correct implementation of Pause in a generative player —
+it preserves the full audio context window and allows seamless resume.
+
+**Do not call `stop()` on Pause.** Stopping the inference thread means:
+- Ring buffer drains
+- Inference state is frozen mid-frame
+- Resume requires a full `trigger_reset()` + `start()` + 80 ms priming delay
+
+```
+// CORRECT: Pause
+set_bypass(true)          // audio → silence; inference thread → still running
+// ... user decides to resume ...
+set_bypass(false)         // audio resumes instantly; no priming, no click
+
+// WRONG: "Pause" via stop
+stop()                    // inference halts, ring buffer drains
+// ... user resumes ...
+trigger_reset()           // required to clear stale state
+start()                   // 80 ms wobble-free priming needed → bad UX
+```
+
+**For CPAL (Rust):** bypass means writing zeros to the CPAL output callback
+while letting the MRT2 inference thread run freely on its own OS thread. Do
+not use `thread::park` or `Condvar::wait` on the inference thread — it needs
+to keep filling the ring buffer even while audio is silent.
+
 ## Audio Engine Setup Must Happen Before Playback
 
 `setupAudioEngine()` is **not** called automatically. If you create a

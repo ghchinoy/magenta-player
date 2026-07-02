@@ -85,8 +85,9 @@ class AudioEngineManager: NSObject {
 
 @MainActor
 class PlayerManager: ObservableObject {
-    @Published var state      = PlayerState()
-    @Published var parameters = ParameterValues()
+    @Published var state          = PlayerState()
+    @Published var parameters     = ParameterValues()
+    @Published var isModelLoaded  = false
     @Published var error: Error?
 
     private let handle: EngineHandle?
@@ -206,50 +207,81 @@ class PlayerManager: ObservableObject {
                 if modelOk {
                     self.state.modelName = name
                     self.state.metrics   = EngineMetrics(from: metrics)
+                    self.isModelLoaded   = true
                     self.applyParameters()
                 } else {
                     self.state.modelName = "Not Loaded"
+                    self.isModelLoaded   = false
                     self.error = PlayerError.modelLoadFailed(path: path)
                 }
             }
         }
     }
 
-    // MARK: - Play / Stop
+    // MARK: - Playback control
 
-    func togglePlay() {
-        guard let ref = handle?.ref else {
-            error = PlayerError.engineCreationFailed
-            return
-        }
-        guard magentart_is_loaded(ref) else {
-            error = PlayerError.notLoaded
-            return
-        }
+    /// Start fresh: clear context, prime ring buffer, begin generating.
+    func play() {
+        guard let ref = handle?.ref else { error = PlayerError.engineCreationFailed; return }
+        guard magentart_is_loaded(ref)  else { error = PlayerError.notLoaded; return }
 
-        state.isPlaying.toggle()
+        state.isPlaying = true
+        state.isPaused  = false
+        state.metrics   = nil             // clear stale metrics from prior session
 
-        if state.isPlaying {
-            magentart_set_bypass(ref, true)   // stay silent while buffer primes
-            magentart_trigger_reset(ref)
-            magentart_start(ref)
-            startMetricsTimer()
-            // Wait 2 inference frame durations (2 × 40 ms = 80 ms) so the
-            // ring buffer has audio before the render block starts pulling.
-            // Without this priming delay the very first reads are zero-padded
-            // and produce audible wobble at playback start.
-            Task {
-                try? await Task.sleep(nanoseconds: 80_000_000)
-                await MainActor.run { [weak self] in
-                    guard let self, let ref = self.handle?.ref,
-                          self.state.isPlaying else { return }
-                    magentart_set_bypass(ref, false)
-                }
+        magentart_reset_dropped_frames(ref)   // dropped_frames counts from this play only
+        magentart_set_bypass(ref, true)       // silent during prime
+        magentart_trigger_reset(ref)
+        magentart_start(ref)
+        startMetricsTimer()
+
+        Task {
+            try? await Task.sleep(nanoseconds: 80_000_000)   // 2 × 40 ms frames
+            await MainActor.run { [weak self] in
+                guard let self, let ref = self.handle?.ref,
+                      self.state.isPlaying, !self.state.isPaused else { return }
+                magentart_set_bypass(ref, false)
             }
+        }
+    }
+
+    /// Pause: bypass output, keep inference thread running, context intact.
+    /// Resume is seamless — no reset, no priming delay.
+    func pause() {
+        guard let ref = handle?.ref, state.isPlaying, !state.isPaused else { return }
+        state.isPaused = true
+        magentart_set_bypass(ref, true)
+        // Leave metrics timer running so the Performance panel stays live.
+    }
+
+    /// Resume from pause: unmute bypass, audio flows immediately.
+    func resume() {
+        guard let ref = handle?.ref, state.isPlaying, state.isPaused else { return }
+        state.isPaused = false
+        magentart_set_bypass(ref, false)
+    }
+
+    /// Stop: halt inference thread, clear bypass, reset state.
+    func stop() {
+        guard let ref = handle?.ref else { return }
+        magentart_stop(ref)
+        magentart_set_bypass(ref, true)
+        state.isPlaying = false
+        state.isPaused  = false
+        stopMetricsTimer()
+    }
+
+    /// Space-bar / menu-bar smart toggle:
+    ///   stopped  → play   (fresh start with reset)
+    ///   playing  → pause  (silent, context preserved)
+    ///   paused   → resume (seamless, no reset)
+    func smartToggle() {
+        if !state.isPlaying {
+            play()
+        } else if state.isPaused {
+            resume()
         } else {
-            magentart_stop(ref)
-            magentart_set_bypass(ref, true)
-            stopMetricsTimer()
+            pause()
         }
     }
 
@@ -268,6 +300,54 @@ class PlayerManager: ObservableObject {
         // Default is 2048 (~42 ms), which leaves only 2.7 ms above one frame —
         // insufficient to absorb Metal GPU scheduling jitter, causing underruns.
         magentart_set_buffer_size(ref, UInt32(parameters.buffersize))
+        // Text prompt: the primary creative control — steers MusicCoCa style embedding.
+        magentart_set_text_prompt(ref, parameters.textPrompt)
+        // CFG weights: how strongly each conditioning signal overrides the audio context.
+        magentart_set_cfg_musiccoca(ref, parameters.cfgmusiccoca)
+        magentart_set_cfg_notes(ref, parameters.cfgnotes)
+        magentart_set_cfg_drums(ref, parameters.cfgdrums)
+    }
+
+    /// Human-readable model description derived from the loaded filename.
+    var modelDescription: String {
+        let name = state.modelName
+        if name == "Not Loaded" || name.hasPrefix("Loading") { return name }
+        if name.contains("small") { return "\(name)  ·  230 M params" }
+        if name.contains("base")  { return "\(name)  ·  2.4 B params" }
+        return name
+    }
+
+    /// App version from Info.plist, or "dev" if not found.
+    var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+    }
+
+    /// Clear the audio context window and re-anchor to the current text prompt.
+    /// Safe to call mid-playback — the transition is click-free (one-frame fade).
+    /// Most effective when combined with a prompt change.
+    func resetContext() {
+        guard let ref = handle?.ref else { return }
+        magentart_trigger_reset(ref)
+    }
+
+    func setVolume(_ db: Float) {
+        parameters.volume = db
+        guard let ref = handle?.ref else { return }
+        magentart_set_volume_db(ref, db)
+    }
+
+    func setMute(_ muted: Bool) {
+        parameters.mute = muted
+        guard let ref = handle?.ref else { return }
+        magentart_set_mute(ref, muted)
+    }
+
+    /// Update the text style prompt live — safe to call on every keystroke.
+    /// Does not go through the full applyParameters() to avoid redundant calls.
+    func setTextPrompt(_ text: String) {
+        parameters.textPrompt = text
+        guard let ref = handle?.ref else { return }
+        magentart_set_text_prompt(ref, text)
     }
 
     // MARK: - Metrics polling

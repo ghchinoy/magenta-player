@@ -105,6 +105,14 @@ bool magentart_read_audio_stereo(MagentaEngineRef engine,
 void magentart_set_temperature(MagentaEngineRef engine, float t);
 void magentart_set_top_k(MagentaEngineRef engine, int k);
 
+// Classifier-free guidance weights.
+// cfg_musiccoca: how strongly the text/audio style embedding steers generation.
+//   Range 1.0–8.0; default 3.0. Higher = more prompt adherence, less drift.
+//   See docs/mrt2-prompt-and-drift.md for CFG semantics.
+void magentart_set_cfg_musiccoca(MagentaEngineRef engine, float v);
+void magentart_set_cfg_notes(MagentaEngineRef engine, float v);
+void magentart_set_cfg_drums(MagentaEngineRef engine, float v);
+
 // ---------------------------------------------------------------------------
 // Output control  (atomic — any thread)
 // ---------------------------------------------------------------------------
@@ -149,6 +157,11 @@ void magentart_set_buffer_size(MagentaEngineRef engine, uint32_t samples);
 
 /// Snapshot current engine metrics. Safe to call frequently (e.g. 10 Hz).
 MagentaMetrics magentart_get_metrics(MagentaEngineRef engine);
+
+/// Reset the cumulative dropped-frame counter to zero.
+/// Call at the start of each new play session so the counter reflects
+/// only the current session's underruns.
+void magentart_reset_dropped_frames(MagentaEngineRef engine);
 
 #ifdef __cplusplus
 }

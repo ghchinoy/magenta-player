@@ -1,0 +1,116 @@
+digraph mrt2_architecture {
+    rankdir=LR
+    graph [bgcolor=white, fontname="Helvetica Neue", pad=0.5, nodesep=0.6, ranksep=1.0]
+    node  [fontname="Helvetica Neue", fontsize=12, style=filled, penwidth=1.5]
+    edge  [fontname="Helvetica Neue", fontsize=10, penwidth=1.2]
+
+    // ── Inputs ───────────────────────────────────────────────────────────────
+
+    subgraph cluster_inputs {
+        label="Inputs"
+        fontsize=11
+        fontcolor="#555555"
+        style=dashed
+        color="#cccccc"
+
+        text_prompt [
+            label="Text Prompt\n\"jazz piano trio\""
+            shape=note, fillcolor="#FFF9C4", color="#F9A825"
+        ]
+        midi_in [
+            label="MIDI Input\nnote on / off"
+            shape=note, fillcolor="#C8E6C9", color="#388E3C"
+        ]
+    }
+
+    // ── Encoders ─────────────────────────────────────────────────────────────
+
+    musiccoca [
+        label="MusicCoCa\nText + Audio Encoder"
+        shape=box, fillcolor="#FF8A65", color="#E64A19", fontcolor=white
+    ]
+    spectro_enc [
+        label="SpectroStream\nEncoder"
+        shape=box, fillcolor="#4DB6AC", color="#00796B", fontcolor=white
+    ]
+    midi_enc [
+        label="Multihot\nEncoder"
+        shape=box, fillcolor="#81C784", color="#388E3C", fontcolor=white
+    ]
+
+    // ── Conditioning tokens ──────────────────────────────────────────────────
+
+    style_tokens [
+        label="12 Style Tokens\n(static per prompt)"
+        shape=oval, fillcolor="#FFCCBC", color="#E64A19"
+    ]
+    audio_tokens [
+        label="≤ 500 Audio Tokens\n(rolling 20 s window)"
+        shape=oval, fillcolor="#B2DFDB", color="#00796B"
+    ]
+    midi_vec [
+        label="128-dim Multihot\n(frame MIDI state)"
+        shape=oval, fillcolor="#C8E6C9", color="#388E3C"
+    ]
+
+    // ── Core ─────────────────────────────────────────────────────────────────
+
+    transformer [
+        label="Decoder Transformer LLM\nmrt2_small  230 M params\nmrt2_base   2.4 B params\n\n25 Hz · one frame = 40 ms"
+        shape=box3d, fillcolor="#512DA8", color="#311B92", fontcolor=white, fontsize=13
+    ]
+
+    // ── Decoder ──────────────────────────────────────────────────────────────
+
+    spectro_dec [
+        label="SpectroStream\nDecoder"
+        shape=box, fillcolor="#4DB6AC", color="#00796B", fontcolor=white
+    ]
+
+    // ── Output ───────────────────────────────────────────────────────────────
+
+    pcm_out [
+        label="Stereo PCM\n48 kHz · 32-bit float"
+        shape=note, fillcolor="#E8EAF6", color="#3949AB"
+    ]
+
+    // ── Audio context (the drift source) ────────────────────────────────────
+
+    audio_ctx [
+        label="Audio Context Window\n~20 s of generated history"
+        shape=cylinder, fillcolor="#B0BEC5", color="#455A64"
+        fontsize=11
+    ]
+
+    // ── Edges ────────────────────────────────────────────────────────────────
+
+    text_prompt  -> musiccoca   [color="#E64A19"]
+    musiccoca    -> style_tokens [color="#E64A19"]
+    style_tokens -> transformer  [color="#E64A19", label="style\ndirection"]
+
+    audio_ctx    -> spectro_enc  [color="#00796B"]
+    spectro_enc  -> audio_tokens [color="#00796B"]
+    audio_tokens -> transformer  [color="#00796B", label="local\ncontinuation"]
+
+    midi_in      -> midi_enc    [color="#388E3C"]
+    midi_enc     -> midi_vec    [color="#388E3C"]
+    midi_vec     -> transformer [color="#388E3C", label="note\nstate"]
+
+    transformer  -> spectro_dec [color="#512DA8"]
+    spectro_dec  -> pcm_out     [color="#3949AB"]
+
+    // Autoregressive feedback — this is why drift happens
+    pcm_out -> audio_ctx [
+        label="  autoregressive\n  feedback loop"
+        style=dashed, color="#B71C1C", fontcolor="#B71C1C"
+        penwidth=2.0, constraint=false
+    ]
+
+    // ── CFG annotation ───────────────────────────────────────────────────────
+
+    cfg_note [
+        label="cfg_musiccoca controls\nhow strongly style_tokens\noverride audio_tokens"
+        shape=plaintext, fontsize=10, fontcolor="#7B1FA2"
+    ]
+    cfg_note -> transformer [style=dotted, color="#7B1FA2", arrowhead=none]
+}

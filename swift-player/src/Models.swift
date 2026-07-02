@@ -36,23 +36,34 @@ extension EngineMetrics {
 }
 
 struct PlayerState {
-    var isPlaying  = false
+    var isPlaying  = false  // inference thread is running (includes paused)
+    var isPaused   = false  // bypass is on — silent but context preserved
     var modelName  = "Not Loaded"
     var audioLevels: (left: Float, right: Float) = (0.0, 0.0)
     var metrics: EngineMetrics?
     var midiSources: [MIDIEndpointRef] = []
+
+    /// True only when inference is running AND audio is flowing (not bypassed).
+    var isGenerating: Bool { isPlaying && !isPaused }
 }
 
 struct ParameterValues {
+    /// Free-text style prompt forwarded to MusicCoCa for embedding.
+    /// This is the primary creative control — steers the musical style of
+    /// generation. Empty string = unconditioned (random/average) output.
+    var textPrompt: String = ""
     var temperature: Float = 1.3
     var topk: Int = 40
     var cfgmusiccoca: Float = 3.0
     var cfgnotes: Float = 1.0
     var cfgdrums: Float = 1.0
-    var volume: Float = 0.8
+    var volume: Float = 0.0   // dB — 0.0 = unity gain, range -40 to +6
     var mute: Bool = false
     var unmaskwidth: Int = 4
-    var buffersize: Int = 4096
+    // 8192 = max ring buffer capacity (~170 ms, 4 inference frames).
+    // mrt2_base inference can take 50–80 ms on M1 Pro; this gives enough
+    // headroom to absorb variance without underruns on supported hardware.
+    var buffersize: Int = 8192
     var latencycomp: Bool = false
     var weight0: Float = 0.0
     var weight1: Float = 0.0

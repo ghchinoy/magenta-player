@@ -109,6 +109,21 @@ void magentart_set_top_k(MagentaEngineRef engine, int k) {
     cast(engine)->set_top_k(k);
 }
 
+void magentart_set_cfg_musiccoca(MagentaEngineRef engine, float v) {
+    if (!engine) return;
+    cast(engine)->set_cfg_musiccoca(v);
+}
+
+void magentart_set_cfg_notes(MagentaEngineRef engine, float v) {
+    if (!engine) return;
+    cast(engine)->set_cfg_notes(v);
+}
+
+void magentart_set_cfg_drums(MagentaEngineRef engine, float v) {
+    if (!engine) return;
+    cast(engine)->set_cfg_drums(v);
+}
+
 // ---------------------------------------------------------------------------
 // Output control
 // ---------------------------------------------------------------------------
@@ -163,6 +178,11 @@ void magentart_set_buffer_size(MagentaEngineRef engine, uint32_t samples) {
 // ---------------------------------------------------------------------------
 // Metrics
 // ---------------------------------------------------------------------------
+
+void magentart_reset_dropped_frames(MagentaEngineRef engine) {
+    if (!engine) return;
+    cast(engine)->reset_dropped_frames();
+}
 
 MagentaMetrics magentart_get_metrics(MagentaEngineRef engine) {
     MagentaMetrics out{};

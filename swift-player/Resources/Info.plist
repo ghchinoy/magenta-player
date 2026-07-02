@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Identity -->
+    <key>CFBundleIdentifier</key>
+    <string>com.magenta.magenta-player</string>
+    <key>CFBundleName</key>
+    <string>Magenta Player</string>
+    <key>CFBundleDisplayName</key>
+    <string>Magenta Player</string>
+    <key>CFBundleExecutable</key>
+    <string>magenta-player</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+
+    <!-- Platform -->
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <!-- Required for keyboard input and Dock presence -->
+    <key>LSUIElement</key>
+    <false/>
+
+    <!-- Audio: no microphone needed, we only output -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Magenta Player uses the audio output only.</string>
+</dict>
+</plist>

@@ -7,13 +7,13 @@
 #
 # Preferred entry point (from repo root):
 #   make build-swift     # builds mrt2 if needed, then the Swift player
-#   make run-swift       # incremental rebuild + launch
+#   make run-swift       # incremental rebuild + launch as a proper .app
 #
 # Standalone (from this directory):
 #   make setup           # delegates to ../mrt2-build
 #   make build-mrt2      # delegates to ../mrt2-build
-#   make build-swift     # release binary → .build/release/magenta-player
-#   make run-swift       # incremental build + launch
+#   make build-swift     # release binary + .app bundle → .build/MagentaPlayer.app
+#   make run-swift       # build (if needed) + open .app (keyboard input works)
 #   make clean           # remove Swift build artifacts only
 #
 # Override the shared library path (e.g. CI):
@@ -25,14 +25,19 @@
 # Paths                                                                         #
 # --------------------------------------------------------------------------- #
 
-# Absolute path to this Makefile's directory (swift-player/)
 SELF_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 
-# Shared MRT2 library — resolve relative to swift-player/ unless overridden
-# by an environment variable (set by the root Makefile via 'export').
 MRT2_BUILD_DIR ?= $(abspath $(SELF_DIR)/../mrt2-build)
 
 SWIFT_BUILD_DIR := $(SELF_DIR)/.build
+RELEASE_BINARY  := $(SWIFT_BUILD_DIR)/release/magenta-player
+
+# The .app bundle — assembled from the release binary + Info.plist.
+# Launching via `open` gives the app proper keyboard focus and a Dock icon.
+APP_BUNDLE   := $(SWIFT_BUILD_DIR)/MagentaPlayer.app
+APP_MACOS    := $(APP_BUNDLE)/Contents/MacOS
+APP_BINARY   := $(APP_MACOS)/magenta-player
+INFO_PLIST   := $(SELF_DIR)/Resources/Info.plist
 
 # --------------------------------------------------------------------------- #
 # Parallelism                                                                   #
@@ -55,14 +60,13 @@ help:
 	@echo "Targets:"
 	@echo "  setup        Delegate to shared mrt2-build: clone + Python/MLX deps"
 	@echo "  build-mrt2   Delegate to shared mrt2-build: compile C++ engine"
-	@echo "  build-swift  Swift release build → .build/release/magenta-player"
-	@echo "  run-swift    Incremental build + launch the app"
+	@echo "  build-swift  Release build + assemble .app bundle"
+	@echo "  run-swift    Build (if needed) and launch MagentaPlayer.app via open"
 	@echo "  all          build-mrt2 → build-swift"
 	@echo "  clean        Remove Swift .build/ artifacts"
 	@echo ""
-	@echo "Shared library: $(MRT2_BUILD_DIR)"
-	@echo "Binary target : $(SWIFT_BUILD_DIR)/release/magenta-player"
-	@echo "                $(SWIFT_BUILD_DIR)/MRT2  (copy)"
+	@echo "Shared library : $(MRT2_BUILD_DIR)"
+	@echo "App bundle     : $(APP_BUNDLE)"
 
 # --------------------------------------------------------------------------- #
 # Shared engine (delegated)                                                     #
@@ -80,8 +84,9 @@ build-mrt2:
 # Swift player                                                                  #
 # --------------------------------------------------------------------------- #
 
-# build-swift depends on build-mrt2 so `make build-swift` from this directory
-# always ensures the shared library is up to date first.
+# build-swift compiles the Swift package then assembles a proper .app bundle.
+# Launching the bundle via `open` gives the app a Dock presence and routes
+# keyboard events correctly — plain executables from `swift run` do not.
 build-swift: build-mrt2
 	@echo "=== Building Swift player (release) ==="
 	@if ! command -v swift >/dev/null 2>&1; then \
@@ -90,24 +95,36 @@ build-swift: build-mrt2
 		exit 1; \
 	fi
 	MRT2_BUILD_DIR="$(MRT2_BUILD_DIR)" swift build -c release --product magenta-player
-	@mkdir -p "$(SWIFT_BUILD_DIR)"
-	@cp "$(SWIFT_BUILD_DIR)/release/magenta-player" "$(SWIFT_BUILD_DIR)/MRT2"
+	@echo ""
+	@echo "=== Assembling MagentaPlayer.app bundle ==="
+	@mkdir -p "$(APP_MACOS)" "$(APP_BUNDLE)/Contents/Resources"
+	@cp "$(RELEASE_BINARY)" "$(APP_BINARY)"
+	@cp "$(INFO_PLIST)" "$(APP_BUNDLE)/Contents/Info.plist"
+	@cp "$(SELF_DIR)/Resources/about-logo.png" "$(APP_BUNDLE)/Contents/Resources/"
 	@echo ""
 	@echo "Build complete:"
-	@echo "  $(SWIFT_BUILD_DIR)/release/magenta-player"
-	@echo "  $(SWIFT_BUILD_DIR)/MRT2  (copy)"
+	@echo "  binary : $(RELEASE_BINARY)"
+	@echo "  bundle : $(APP_BUNDLE)"
+	@echo ""
+	@echo "Launch with:  make run-swift"
+	@echo "           or open \"$(APP_BUNDLE)\""
 
-# run-swift does NOT depend on build-mrt2 — it uses swift run which does an
-# incremental Swift-only rebuild. The C++ library only matters once the real
-# bridge is wired up.
-run-swift:
-	@echo "=== Launching Magenta Player ==="
+# run-swift builds incrementally (swift build, not swift run) then opens the
+# .app bundle so macOS routes keyboard events to it properly.
+run-swift: build-mrt2
+	@echo "=== Building and launching MagentaPlayer.app ==="
 	@if ! command -v swift >/dev/null 2>&1; then \
 		echo "ERROR: Swift compiler not found."; \
 		echo "Install Xcode Command Line Tools:  xcode-select --install"; \
 		exit 1; \
 	fi
-	MRT2_BUILD_DIR="$(MRT2_BUILD_DIR)" swift run magenta-player
+	MRT2_BUILD_DIR="$(MRT2_BUILD_DIR)" swift build --product magenta-player
+	@mkdir -p "$(APP_MACOS)" "$(APP_BUNDLE)/Contents/Resources"
+	@cp "$(SWIFT_BUILD_DIR)/debug/magenta-player" "$(APP_BINARY)"
+	@cp "$(INFO_PLIST)" "$(APP_BUNDLE)/Contents/Info.plist"
+	@cp "$(SELF_DIR)/Resources/about-logo.png" "$(APP_BUNDLE)/Contents/Resources/"
+	@echo "Opening $(APP_BUNDLE) ..."
+	open "$(APP_BUNDLE)"
 
 # --------------------------------------------------------------------------- #
 # Aggregate                                                                     #
@@ -131,7 +148,7 @@ clean-legacy:
 	@echo "=== Removing legacy swift-player/magenta-realtime/ clone ==="
 	@if [ -d "$(SELF_DIR)/magenta-realtime" ]; then \
 		rm -rf "$(SELF_DIR)/magenta-realtime"; \
-		echo "Removed swift-player/magenta-realtime/ ($(shell du -sh $(SELF_DIR)/magenta-realtime 2>/dev/null | cut -f1) freed)."; \
+		echo "Removed swift-player/magenta-realtime/."; \
 	else \
 		echo "Nothing to remove — swift-player/magenta-realtime/ does not exist."; \
 	fi
