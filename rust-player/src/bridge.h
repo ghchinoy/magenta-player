@@ -1,0 +1,71 @@
+// Header file declaring the bridge wrappers.
+// This is used by 'cxx' to generate compile-time bidirectional bindings between Rust and the C++ magentart core.
+
+#pragma once
+#include <memory>
+#include <string>
+#include <vector>
+#include <magentart/realtime_runner.h>
+#include "rust/cxx.h"
+
+class RealtimeRunnerBridge {
+public:
+    RealtimeRunnerBridge() : runner_(std::make_unique<magentart::core::RealtimeRunner>()) {}
+
+    bool load_model(rust::Str path) {
+        std::string path_str(path.data(), path.size());
+        return runner_->load_model(path_str.c_str());
+    }
+
+    void set_prompt(rust::Str prompt) {
+        std::string prompt_str(prompt.data(), prompt.size());
+        std::vector<std::string> prompts = { prompt_str };
+        std::vector<float> weights = { 1.0f };
+        runner_->set_text_prompts(prompts, weights);
+    }
+
+    void set_temperature(float temp) {
+        runner_->set_temperature(temp);
+    }
+
+    void set_top_k(uint32_t k) {
+        runner_->set_top_k(k);
+    }
+
+    void set_midi_gate(bool enabled) {
+        runner_->set_midi_gate_enabled(enabled);
+    }
+
+    void set_buffer_size(size_t cap) {
+        runner_->set_buffer_size(cap);
+    }
+
+    void toggle_play(bool playing) const {
+        auto* r = const_cast<magentart::core::RealtimeRunner*>(runner_.get());
+        r->set_bypass(!playing);
+        if (playing) {
+            r->trigger_reset();
+        }
+    }
+
+    bool read_audio_stereo(rust::Slice<float> dest_l, rust::Slice<float> dest_r) const {
+        // Const_cast is safe here because read_audio_stereo has atomic operations on lock-free ring buffers
+        auto* r = const_cast<magentart::core::RealtimeRunner*>(runner_.get());
+        return r->read_audio_stereo(dest_l.data(), dest_r.data(), dest_l.size(), false);
+    }
+
+    rust::String read_metrics() const {
+        auto m = runner_->get_metrics();
+        // Return structured metrics as JSON to easily parse on the Rust side
+        std::string s = "{\"transformer_ms\":" + std::to_string(m.transformer_ms) + 
+                       ",\"dropped_frames\":" + std::to_string(m.dropped_frames) + "}";
+        return rust::String(s);
+    }
+
+private:
+    std::unique_ptr<magentart::core::RealtimeRunner> runner_;
+};
+
+inline std::unique_ptr<RealtimeRunnerBridge> create_runner() {
+    return std::make_unique<RealtimeRunnerBridge>();
+}

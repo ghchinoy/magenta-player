@@ -1,0 +1,12 @@
+# Cloned magenta-realtime source (managed by `make setup`)
+magenta-realtime/
+
+# cmake/build logs
+build.log
+
+# Compiled static libraries (output of `make build-mrt2`)
+libmagentart_core.a
+libmagentart_all.a
+
+# Python virtual environment (for `mrt` model management CLI)
+.venv/

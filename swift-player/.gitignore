@@ -1,0 +1,15 @@
+# Swift Package Manager build output
+.build/
+.swiftpm/
+Package.pins
+*.xcodeproj/
+*.xcworkspace/
+
+# Legacy private magenta-realtime clone (superseded by mrt2-build/)
+magenta-realtime/
+
+# Python virtual environment
+.venv/
+
+# macOS metadata
+.DS_Store

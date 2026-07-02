@@ -1,0 +1,29 @@
+[package]
+name = "magenta-rust-player"
+version = "0.1.0"
+edition = "2021"
+authors = ["opencode <opencode@magenta-player.local>"]
+description = "A native Rust CLI player and controller wrapper for Magenta RealTime 2"
+readme = "README.md"
+license = "Apache-2.0"
+build = "build.rs"
+
+[dependencies]
+# Beautiful command-line argument parser
+clap = { version = "4.4", features = ["derive"] }
+
+# Cross-platform real-time audio output library
+cpal = "0.15"
+
+# Safe, fast bidirectional C++ FFI interop
+cxx = "1.0"
+
+# Audio level utilities and standard serialization/logging
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.10"
+
+[build-dependencies]
+# Required for compiling the C++ magentart bridge on the fly
+cxx-build = "1.0"
