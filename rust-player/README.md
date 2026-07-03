@@ -27,7 +27,13 @@ cfg_notes = 5.0    # CFG weight for MIDI note conditioning
 cfg_drums = 1.0    # CFG weight for drum conditioning (try 0.0 with drumless=false for softer drums)
 drumless = false   # Suppress drums entirely, independent of the style prompt
 volume_db = 0.0    # Output gain in dB (0.0 = unity gain)
+output_dir = "~/Documents/Magenta/magenta-rt-v2/recordings"  # Default folder for --record clips
 ```
+
+> Config files are forward-compatible: if a future version adds a new field, an older
+> `config.toml` missing that key loads fine (the new field is filled in from its default)
+> rather than being reset. The file is normalized/rewritten on next load so `config list`
+> always reflects the complete, effective settings.
 
 > **⚠️ `resources` is required for `--prompt` to have any effect.** It points at the
 > MusicCoCa tokenizer/text-encoder/quantizer assets (`init_assets()`), loaded separately
@@ -55,11 +61,37 @@ Launches real-time audio streaming.
 
 # Drumless ambient pad, dialed-down drum CFG, quieter output for this run only
 ./target/release/magenta-rust-player play --drumless true --cfg-drums 0.0 --volume-db=-6.0
+
+# Capture a 10-second WAV clip to the default folder, then exit
+./target/release/magenta-rust-player play --record
+
+# Capture a 30-second clip with a specific prompt, saved to a custom folder
+./target/release/magenta-rust-player play --record --record-seconds 30 \
+  --prompt "smooth electric piano chords, rhodes, 90s jazz vibes" \
+  --output-dir ~/Desktop/mrt2-clips
 ```
 
 > **Note:** Negative numeric values (e.g. a negative `--volume-db`) must use the `=` form —
 > `--volume-db=-6.0` — not `--volume-db -6.0`, otherwise clap mistakes `-6.0` for a flag.
 > The same applies to `config set volume_db -6.0`, which works fine since it's a positional arg.
+
+#### Recording (`--record`)
+
+Passing `--record` captures a fixed-length clip and **exits automatically** once saved —
+it's a one-shot "give me a WAV to listen to / share" utility, not a background-recording mode.
+
+- **Default folder**: `~/Documents/Magenta/magenta-rt-v2/recordings/` (config key `output_dir`,
+  override per-run with `--output-dir <PATH>`; the folder is created automatically if missing).
+- **Default filename**: timestamped, e.g. `recording-20260702-181046.wav` (`recording-YYYYMMDD-HHMMSS.wav`),
+  so repeated captures never collide or overwrite each other.
+- **Default duration**: 10 seconds (`--record-seconds <N>` to change). The actual captured
+  duration is reported after saving and may be a little shorter than requested — recording
+  starts capturing from whatever moment the engine's internal buffer begins accumulating
+  after `start_recording()`, not necessarily instantaneously.
+- **Format**: 16-bit PCM WAV, stereo, 48 kHz — pulled directly from the engine's internal
+  recording buffer at its native sample rate, **independent of whatever your live CPAL output
+  fell back to** (e.g. a 44.1 kHz Sonos/Bluetooth device). Recorded clips are always pristine
+  native-rate audio even if what you're *hearing* live has the 44.1 kHz warble described above.
 
 #### `play` Flag Reference
 ```text
@@ -74,6 +106,9 @@ Launches real-time audio streaming.
       --cfg-drums <CFG_DRUMS>       CFG weight for drum conditioning. Factory default: 1.0
       --drumless <DRUMLESS>         Suppress drums entirely, independent of the style prompt [true|false]
       --volume-db <VOLUME_DB>       Output gain in dB (0.0 = unity gain)
+      --record                      Record a WAV clip of this session and exit once done
+      --record-seconds <SECONDS>    Duration to record when --record is set [default: 10]
+      --output-dir <OUTPUT_DIR>     Directory to save recorded WAV clips into (overrides config output_dir)
   -h, --help                        Print help
 ```
 
@@ -101,7 +136,7 @@ Inspects and modifies your saved defaults.
 ./target/release/magenta-rust-player config set model none
 ```
 
-**Valid `config set` keys**: `model`, `resources`, `prompt`, `temperature`, `topk`, `midi_gate`, `cfg_text`, `cfg_notes`, `cfg_drums`, `drumless`, `volume_db`.
+**Valid `config set` keys**: `model`, `resources`, `prompt`, `temperature`, `topk`, `midi_gate`, `cfg_text`, `cfg_notes`, `cfg_drums`, `drumless`, `volume_db`, `output_dir`.
 
 ---
 

@@ -34,6 +34,15 @@ mod ffi {
             dest_r: &mut [f32],
         ) -> bool;
         fn read_metrics(self: &RealtimeRunnerBridge) -> String;
+        fn start_recording(self: &RealtimeRunnerBridge);
+        fn stop_recording(self: &RealtimeRunnerBridge);
+        fn get_recorded_sample_count(self: &RealtimeRunnerBridge) -> usize;
+        fn get_recorded_audio(
+            self: &RealtimeRunnerBridge,
+            start_idx: usize,
+            dest_l: &mut [f32],
+            dest_r: &mut [f32],
+        ) -> bool;
     }
 }
 
@@ -42,7 +51,16 @@ unsafe impl Send for ffi::RealtimeRunnerBridge {}
 unsafe impl Sync for ffi::RealtimeRunnerBridge {}
 
 /// Configuration Structure for XDG Config Support
+///
+/// `#[serde(default)]` at the struct level means any field missing from an
+/// older config.toml (e.g. after we add a new field in a later version) is
+/// filled in from `AppConfig::default()` below, rather than failing to parse
+/// -- which would otherwise silently fall through to load_config()'s
+/// from-scratch AppConfig::default() + save_config(), wiping out the user's
+/// existing saved model path, prompt, etc. Always add new fields with this
+/// safety in mind.
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
 struct AppConfig {
     model: Option<String>,
     resources: String,
@@ -60,6 +78,8 @@ struct AppConfig {
     drumless: bool,
     /// Output gain in dB (0.0 = unity gain / no change).
     volume_db: f32,
+    /// Default directory for --record output WAV files.
+    output_dir: String,
 }
 
 impl Default for AppConfig {
@@ -77,6 +97,7 @@ impl Default for AppConfig {
             cfg_drums: 1.0,
             drumless: false,
             volume_db: 0.0,
+            output_dir: "~/Documents/Magenta/magenta-rt-v2/recordings".to_string(),
         }
     }
 }
@@ -93,7 +114,13 @@ fn load_config() -> AppConfig {
     let path = get_config_path();
     if path.exists() {
         if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(config) = toml::from_str(&content) {
+            if let Ok(config) = toml::from_str::<AppConfig>(&content) {
+                // Self-heal: if this file predates a field we've since added,
+                // #[serde(default)] silently filled it in above -- persist that
+                // now so `config list`/the file on disk always reflects the
+                // full, effective configuration rather than only what the user
+                // has explicitly touched via `config set`.
+                save_config(&config);
                 return config;
             }
         }
@@ -172,6 +199,18 @@ struct PlayArgs {
     /// Output gain in dB (0.0 = unity gain). Use --volume-db=-6.0 syntax for negative values.
     #[arg(long, allow_hyphen_values = true)]
     volume_db: Option<f32>,
+
+    /// Record a WAV clip of this session and exit once done (see --record-seconds, --output-dir)
+    #[arg(long)]
+    record: bool,
+
+    /// Duration in seconds to record when --record is set
+    #[arg(long, default_value_t = 10)]
+    record_seconds: u64,
+
+    /// Directory to save recorded WAV clips into (overrides config output_dir)
+    #[arg(long, value_name = "OUTPUT_DIR")]
+    output_dir: Option<String>,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -298,9 +337,12 @@ fn main() {
                                 std::process::exit(1);
                             }
                         }
+                        "output_dir" => {
+                            config.output_dir = value.clone();
+                        }
                         _ => {
                             eprintln!("❌ Error: Unknown configuration key '{}'", key);
-                            eprintln!("Valid keys: model, resources, prompt, temperature, topk, midi_gate, cfg_text, cfg_notes, cfg_drums, drumless, volume_db");
+                            eprintln!("Valid keys: model, resources, prompt, temperature, topk, midi_gate, cfg_text, cfg_notes, cfg_drums, drumless, volume_db, output_dir");
                             std::process::exit(1);
                         }
                     }
@@ -342,6 +384,9 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     let cfg_drums = args.cfg_drums.unwrap_or(config.cfg_drums);
     let drumless = args.drumless.unwrap_or(config.drumless);
     let volume_db = args.volume_db.unwrap_or(config.volume_db);
+    let output_dir = expand_tilde(&args.output_dir.unwrap_or(config.output_dir));
+    let record = args.record;
+    let record_seconds = args.record_seconds;
 
     println!("=== Magenta RealTime 2 Rust Player CLI ===");
     println!("Prompt:      \"{}\"", prompt);
@@ -356,6 +401,9 @@ fn run_player(config: AppConfig, args: PlayArgs) {
         println!("Model Path:  {}", path);
     } else {
         println!("Model Path:  None");
+    }
+    if record {
+        println!("Recording:   {} seconds -> {}", record_seconds, output_dir);
     }
     println!("=========================================");
 
@@ -503,6 +551,62 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     // 7. Start the C++ real-time inference thread
     println!("Starting real-time playback pipeline...");
     runner.toggle_play(true);
+
+    // 8. If --record was requested, capture a fixed-length clip and exit.
+    // Note: this pulls from the engine's internal recording buffer, which is
+    // populated at MRT2's native 48kHz float PCM directly from the C++ side --
+    // independent of whatever sample rate our CPAL live-listening output
+    // fell back to (see the 44.1kHz Sonos/Bluetooth warning above). Recorded
+    // clips are always pristine native-rate audio regardless of that.
+    if record {
+        std::fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
+            eprintln!("❌ Error: Failed to create output directory {}: {}", output_dir, e);
+            std::process::exit(1);
+        });
+
+        println!("\n[INFO] Recording {} seconds...", record_seconds);
+        runner.start_recording();
+        std::thread::sleep(std::time::Duration::from_secs(record_seconds));
+        runner.stop_recording();
+
+        let sample_count = runner.get_recorded_sample_count();
+        if sample_count == 0 {
+            eprintln!("❌ Error: No audio was captured (0 samples recorded).");
+            std::process::exit(1);
+        }
+
+        let mut left = vec![0.0f32; sample_count];
+        let mut right = vec![0.0f32; sample_count];
+        runner.get_recorded_audio(0, &mut left, &mut right);
+
+        let filename = format!("recording-{}.wav", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+        let out_path = std::path::Path::new(&output_dir).join(&filename);
+
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&out_path, spec).unwrap_or_else(|e| {
+            eprintln!("❌ Error: Failed to create WAV file {}: {}", out_path.display(), e);
+            std::process::exit(1);
+        });
+        for i in 0..sample_count {
+            let l_i16 = (left[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            let r_i16 = (right[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            writer.write_sample(l_i16).ok();
+            writer.write_sample(r_i16).ok();
+        }
+        writer.finalize().unwrap_or_else(|e| {
+            eprintln!("❌ Error: Failed to finalize WAV file: {}", e);
+            std::process::exit(1);
+        });
+
+        println!("✓ Recorded {:.1}s ({} samples) to: {}", 
+            sample_count as f64 / 48000.0, sample_count, out_path.display());
+        return;
+    }
 
     println!("\n[INFO] Playback running. Press Ctrl+C to stop.");
     

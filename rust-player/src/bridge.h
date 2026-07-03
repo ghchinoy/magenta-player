@@ -117,6 +117,28 @@ public:
         return rust::String(s);
     }
 
+    // Recording controls: the engine maintains an internal circular buffer of
+    // ALL generated audio automatically once start_recording() is called --
+    // no manual sample-capture loop needed on our side. const + const_cast
+    // here to match toggle_play()/read_audio_stereo() so these are callable
+    // through the shared (immutable) Arc<RealtimeRunnerBridge> used by the
+    // CPAL audio thread, from the main thread, without needing Pin<&mut>.
+    void start_recording() const {
+        const_cast<magentart::core::RealtimeRunner*>(runner_.get())->start_recording();
+    }
+
+    void stop_recording() const {
+        const_cast<magentart::core::RealtimeRunner*>(runner_.get())->stop_recording();
+    }
+
+    size_t get_recorded_sample_count() const {
+        return runner_->get_recorded_sample_count();
+    }
+
+    bool get_recorded_audio(size_t start_idx, rust::Slice<float> dest_l, rust::Slice<float> dest_r) const {
+        return runner_->get_recorded_audio(dest_l.data(), dest_r.data(), start_idx, dest_l.size());
+    }
+
 private:
     std::unique_ptr<magentart::core::RealtimeRunner> runner_;
 };
