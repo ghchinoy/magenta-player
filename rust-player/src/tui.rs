@@ -17,6 +17,7 @@ use ratatui::{
     Terminal,
 };
 use std::collections::VecDeque;
+use std::fs::File;
 use std::sync::Arc;
 
 /// Redirects the process's stdout file descriptor to /dev/null for the lifetime
@@ -27,8 +28,13 @@ use std::sync::Arc;
 /// mlx_engine.cpp when the async prompt encoder finishes). During a TUI session
 /// that print lands on the ratatui alternate screen and corrupts the frame until
 /// the next full redraw. We can't patch upstream C++, so we silence fd 1 while
-/// the TUI owns the screen. crossterm/ratatui render through their own handle so
-/// TUI drawing is unaffected. Restored (Drop) even on panic/early return.
+/// the TUI owns the screen.
+///
+/// Crucially, the TUI itself does NOT render through fd 1 while this guard is
+/// active -- it renders through an explicit /dev/tty handle (see
+/// `run_tui_dashboard`). That separation is what makes silencing fd 1 safe:
+/// only the engine's stray writes get dropped, never our own drawing.
+/// Restored (Drop) even on panic/early return.
 struct StdoutSilencer {
     saved_fd: Option<libc::c_int>,
 }
@@ -92,16 +98,26 @@ pub fn run_tui_dashboard(
     model_path: &Option<String>,
     audio_format: String,
 ) {
-    // Silence the C++ engine's raw stdout writes for the duration of the TUI so
-    // they don't corrupt the alternate screen (see StdoutSilencer docs). Dropped
-    // automatically when this function returns, restoring stdout.
-    let stdout_silencer = StdoutSilencer::new();
+    // Render the TUI through an explicit /dev/tty handle rather than stdout. This
+    // lets us redirect the process's fd 1 (stdout) to /dev/null for the session
+    // -- silencing the C++ engine's stray background std::cout writes -- without
+    // affecting our own drawing, which goes to /dev/tty. If /dev/tty can't be
+    // opened (unusual), fall back to a stdout-backed terminal without silencing.
+    let tty = File::options().read(true).write(true).open("/dev/tty").ok();
 
-    // Set up terminal
+    // Only silence fd 1 when we have a separate /dev/tty to draw on; otherwise
+    // silencing would also kill our stdout-backed rendering.
+    let stdout_silencer = tty.as_ref().map(|_| StdoutSilencer::new());
+
     enable_raw_mode().expect("❌ Failed to enable raw mode");
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen).expect("❌ Failed to enter alternate screen");
-    let backend = CrosstermBackend::new(stdout);
+
+    // Backend writer: /dev/tty if available, else stdout.
+    let mut writer: Box<dyn std::io::Write + Send> = match tty {
+        Some(f) => Box::new(f),
+        None => Box::new(std::io::stdout()),
+    };
+    execute!(writer, EnterAlternateScreen).expect("❌ Failed to enter alternate screen");
+    let backend = CrosstermBackend::new(writer);
     let mut terminal = Terminal::new(backend).expect("❌ Failed to create terminal");
 
     // Dynamic history ring for sparkline (will be resized on draw ticks to match terminal columns)
