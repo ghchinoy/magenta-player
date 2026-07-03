@@ -454,6 +454,26 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     let record = args.record;
     let record_seconds = args.record_seconds;
 
+    // Snapshot the effective (CLI-over-config-merged) settings as a complete
+    // AppConfig. The TUI's explicit "save" key (S) updates the live-adjustable
+    // fields on a clone of this and writes it back to config.toml, so a save
+    // preserves the non-TUI fields (model, resources, output_dir, cfg_notes,
+    // drumless) exactly as they were resolved for this session.
+    let effective_config = AppConfig {
+        model: model_path.clone(),
+        resources: resources_path.clone(),
+        prompt: prompt.clone(),
+        temperature,
+        topk,
+        midi_gate,
+        cfg_text,
+        cfg_notes,
+        cfg_drums,
+        drumless,
+        volume_db,
+        output_dir: output_dir.clone(),
+    };
+
     println!("=== Magenta RealTime 2 Rust Player CLI ===");
     println!("Prompt:      \"{}\"", prompt);
     println!("Temperature: {}", temperature);
@@ -756,7 +776,7 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     // CI, log files) so we never corrupt non-terminal output streams.
     use std::io::IsTerminal;
     if std::io::stdout().is_terminal() {
-        run_tui_dashboard(&runner, &prompt, &model_path, temperature, topk, cfg_text, cfg_drums, audio_format_line);
+        run_tui_dashboard(&runner, effective_config, &model_path, audio_format_line);
     } else {
         println!("\n[INFO] Playback running. Press Ctrl+C to stop.");
         let mut count = 0;
@@ -797,12 +817,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 fn run_tui_dashboard(
     runner: &Arc<cxx::UniquePtr<ffi::RealtimeRunnerBridge>>,
-    prompt: &str,
+    base_config: AppConfig,
     model_path: &Option<String>,
-    temperature: f32,
-    topk: u32,
-    cfg_text: f32,
-    cfg_drums: f32,
     audio_format: String,
 ) {
     // Set up terminal
@@ -820,18 +836,24 @@ fn run_tui_dashboard(
     let mut last_dropped: u64 = 0;
     let mut resets: u32 = 0;
 
-    // Mutably track live-adjusted parameters so they reflect in the TUI in real time
-    let mut cur_temp = temperature;
-    let mut cur_topk = topk;
-    let mut cur_cfg_text = cfg_text;
-    let mut cur_cfg_drums = cfg_drums;
-    let mut cur_volume_db = 0.0f32; // CPAL output gain DB defaults to 0.0
-    let mut cur_midi_gate = false; // MIDI gate starts false by default unless overridden
-    let mut current_prompt = prompt.to_string();
+    // Mutably track live-adjusted parameters so they reflect in the TUI in real
+    // time. Initialized from the effective (CLI-over-config-merged) session
+    // settings, so a --volume-db / --midi-gate passed on the CLI is reflected
+    // in the initial TUI display and in what an explicit save would persist.
+    let mut cur_temp = base_config.temperature;
+    let mut cur_topk = base_config.topk;
+    let mut cur_cfg_text = base_config.cfg_text;
+    let mut cur_cfg_drums = base_config.cfg_drums;
+    let mut cur_volume_db = base_config.volume_db;
+    let mut cur_midi_gate = base_config.midi_gate;
+    let mut current_prompt = base_config.prompt.clone();
 
     // Input mode for changing style prompt mid-playback
     let mut input_mode = false;
     let mut input_string = String::new();
+
+    // Transient status message shown in the title bar (e.g. after saving config)
+    let mut status_message: Option<(String, std::time::Instant)> = None;
 
     let model_display = model_path
         .as_deref()
@@ -951,6 +973,25 @@ fn run_tui_dashboard(
                                 cur_midi_gate = !cur_midi_gate;
                                 runner.set_midi_gate(cur_midi_gate);
                             }
+                            // Explicitly persist the current live params to config.toml.
+                            // Preserves the non-TUI-adjustable fields (model,
+                            // resources, output_dir, cfg_notes, drumless) from
+                            // the effective session config.
+                            KeyCode::Char('S') => {
+                                let mut to_save = base_config.clone();
+                                to_save.prompt = current_prompt.clone();
+                                to_save.temperature = cur_temp;
+                                to_save.topk = cur_topk;
+                                to_save.cfg_text = cur_cfg_text;
+                                to_save.cfg_drums = cur_cfg_drums;
+                                to_save.volume_db = cur_volume_db;
+                                to_save.midi_gate = cur_midi_gate;
+                                save_config(&to_save);
+                                status_message = Some((
+                                    "✓ Saved current parameters to config.toml".to_string(),
+                                    std::time::Instant::now(),
+                                ));
+                            }
                             _ => {}
                         }
                     }
@@ -994,6 +1035,14 @@ fn run_tui_dashboard(
             // Gauge ratio: how much of the 40ms budget we're using (capped at 100%)
             let budget_ratio = (trans_ms / 40.0).clamp(0.0, 1.0);
 
+            // Transient status message (e.g. save confirmation), shown for ~3s in the title bar
+            let title_text = match &status_message {
+                Some((msg, at)) if at.elapsed() < std::time::Duration::from_secs(3) => {
+                    format!(" Magenta RealTime 2 — Rust Player    [{}] ", msg)
+                }
+                _ => " Magenta RealTime 2 — Rust Player ".to_string(),
+            };
+
             terminal.draw(|f| {
                 let area = f.area();
                 let rows = Layout::default()
@@ -1003,7 +1052,7 @@ fn run_tui_dashboard(
                         Constraint::Length(4),  // budget gauge
                         Constraint::Length(8),  // sparkline
                         Constraint::Min(0),     // spacer
-                        Constraint::Length(5),  // keyboard control help panel
+                        Constraint::Length(6),  // keyboard control help panel
                     ])
                     .split(area);
 
@@ -1035,7 +1084,7 @@ fn run_tui_dashboard(
                 let info = Paragraph::new(info_lines)
                     .block(Block::default()
                         .borders(Borders::ALL)
-                        .title(" Magenta RealTime 2 — Rust Player ")
+                        .title(title_text.clone())
                         .title_style(Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD)))
@@ -1087,6 +1136,8 @@ fn run_tui_dashboard(
                         Span::raw("Reset Audio Context (re-anchors to prompt)"),
                     ]),
                     Line::from(vec![
+                        Span::styled("  S     ", Style::default().fg(Color::Green)),
+                        Span::raw("Save current params to config    "),
                         Span::styled("  q/ESC ", Style::default().fg(Color::Red)),
                         Span::raw("Quit Player"),
                     ]),

@@ -251,8 +251,11 @@ When running interactively (attached to a real terminal), `play` launches a live
   * `g`         — Toggle **MIDI Gate** on/off
 * **Session Lifecycle**:
   * `r`         — Trigger **audio context reset** mid-playback (re-anchors generation immediately to the current prompt with no audio gap)
+  * `S`         — **Save** the current live parameters (prompt, prompt strength, temperature, top-k, drums CFG, volume, MIDI gate) back to `config.toml`, so they become your defaults next launch. Non-TUI-only fields (model, resources, output_dir, cfg_notes, drumless) are preserved as-is. A confirmation appears briefly in the title bar.
   * `q` / `ESC` — Quit player cleanly and restore terminal
   * `Ctrl-C`   — Quit player cleanly and restore terminal
+
+> **Ephemeral vs persistent:** all live TUI tweaks are runtime-only by design — they steer the current session but are **not** saved unless you press `S`. This mirrors twiddling knobs on a synth vs. explicitly saving a preset. (Named-preset saving is planned separately via Memory Banks.)
 
 Falls back to the plain scrolling metrics log when stdout is not a TTY (piped output, CI, log files, `--record` mode) — the TUI never corrupts non-terminal output streams.
 
