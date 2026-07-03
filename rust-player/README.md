@@ -241,6 +241,7 @@ When running interactively (attached to a real terminal), `play` launches a live
 
 **Keyboard controls (interactive only):**
 * **Inference Parameters (Live Steering)**:
+  * `p` / `/` — **Edit prompt mid-play** (pops up a centered text input modal. Type a new prompt and press **Enter** to encode and immediately reset context, or **ESC** to cancel)
   * `[` / `]` — Decrease / Increase **Prompt Strength** (`cfg_text`) by `0.5` (range: `1.0` - `10.0`)
   * `-` / `+` — Decrease / Increase **Temperature** by `0.1` (range: `0.1` - `2.5`, `=` key works as `+` too)
   * `,` / `.` — Decrease / Increase **Top-K** sampling by `5` (range: `5` - `200`, `<` / `>` work too)

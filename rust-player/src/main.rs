@@ -11,10 +11,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph, Sparkline, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline, Wrap},
     Terminal,
 };
 
@@ -774,6 +774,27 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     }
 }
 
+/// Helper function to create a centered rectangular area for TUI popup modals.
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
 fn run_tui_dashboard(
     runner: &Arc<cxx::UniquePtr<ffi::RealtimeRunnerBridge>>,
     prompt: &str,
@@ -806,6 +827,11 @@ fn run_tui_dashboard(
     let mut cur_cfg_drums = cfg_drums;
     let mut cur_volume_db = 0.0f32; // CPAL output gain DB defaults to 0.0
     let mut cur_midi_gate = false; // MIDI gate starts false by default unless overridden
+    let mut current_prompt = prompt.to_string();
+
+    // Input mode for changing style prompt mid-playback
+    let mut input_mode = false;
+    let mut input_string = String::new();
 
     let model_display = model_path
         .as_deref()
@@ -836,62 +862,97 @@ fn run_tui_dashboard(
             // Poll crossterm events (non-blocking)
             if event::poll(draw_tick)? {
                 if let Event::Key(key) = event::read()? {
-                    match key.code {
-                        // Lifecycle
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                        KeyCode::Char('r') => {
-                            runner.toggle_play(true);
-                            runner.reset_dropped_frames();
-                            resets += 1;
+                    if input_mode {
+                        match key.code {
+                            KeyCode::Enter => {
+                                if !input_string.trim().is_empty() {
+                                    current_prompt = input_string.clone();
+                                    runner.set_prompt(&current_prompt);
+                                    runner.toggle_play(true); // Immediate reset and re-anchor!
+                                    runner.reset_dropped_frames();
+                                    resets += 1;
+                                }
+                                input_mode = false;
+                                input_string.clear();
+                            }
+                            KeyCode::Esc => {
+                                input_mode = false;
+                                input_string.clear();
+                            }
+                            KeyCode::Backspace => {
+                                input_string.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                if input_string.len() < 200 {
+                                    input_string.push(c);
+                                }
+                            }
+                            _ => {}
                         }
-                        
-                        // Interactive Parameter Adjustments (steers C++ runner atomically!)
-                        KeyCode::Char('[') => {
-                            cur_cfg_text = (cur_cfg_text - 0.5).max(1.0);
-                            runner.set_cfg_text(cur_cfg_text);
+                    } else {
+                        match key.code {
+                            // Lifecycle
+                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                            KeyCode::Char('r') => {
+                                runner.toggle_play(true);
+                                runner.reset_dropped_frames();
+                                resets += 1;
+                            }
+                            
+                            // Enter prompt input mode
+                            KeyCode::Char('/') | KeyCode::Char('p') => {
+                                input_mode = true;
+                                input_string = current_prompt.clone();
+                            }
+                            
+                            // Interactive Parameter Adjustments (steers C++ runner atomically!)
+                            KeyCode::Char('[') => {
+                                cur_cfg_text = (cur_cfg_text - 0.5).max(1.0);
+                                runner.set_cfg_text(cur_cfg_text);
+                            }
+                            KeyCode::Char(']') => {
+                                cur_cfg_text = (cur_cfg_text + 0.5).min(10.0);
+                                runner.set_cfg_text(cur_cfg_text);
+                            }
+                            KeyCode::Char('-') => {
+                                cur_temp = (cur_temp - 0.1).max(0.1);
+                                runner.set_temperature(cur_temp);
+                            }
+                            KeyCode::Char('+') | KeyCode::Char('=') => {
+                                cur_temp = (cur_temp + 0.1).min(2.5);
+                                runner.set_temperature(cur_temp);
+                            }
+                            KeyCode::Char(',') | KeyCode::Char('<') => {
+                                cur_topk = cur_topk.saturating_sub(5).max(5);
+                                runner.set_top_k(cur_topk);
+                            }
+                            KeyCode::Char('.') | KeyCode::Char('>') => {
+                                cur_topk = (cur_topk + 5).min(200);
+                                runner.set_top_k(cur_topk);
+                            }
+                            KeyCode::Char('d') => {
+                                cur_cfg_drums = (cur_cfg_drums - 0.5).max(0.0);
+                                runner.set_cfg_drums(cur_cfg_drums);
+                            }
+                            KeyCode::Char('f') => {
+                                cur_cfg_drums = (cur_cfg_drums + 0.5).min(10.0);
+                                runner.set_cfg_drums(cur_cfg_drums);
+                            }
+                            KeyCode::Char('v') => {
+                                cur_volume_db = (cur_volume_db - 2.0).max(-60.0);
+                                runner.set_volume_db(cur_volume_db);
+                            }
+                            KeyCode::Char('b') => {
+                                cur_volume_db = (cur_volume_db + 2.0).min(12.0);
+                                runner.set_volume_db(cur_volume_db);
+                            }
+                            KeyCode::Char('g') => {
+                                cur_midi_gate = !cur_midi_gate;
+                                runner.set_midi_gate(cur_midi_gate);
+                            }
+                            _ => {}
                         }
-                        KeyCode::Char(']') => {
-                            cur_cfg_text = (cur_cfg_text + 0.5).min(10.0);
-                            runner.set_cfg_text(cur_cfg_text);
-                        }
-                        KeyCode::Char('-') => {
-                            cur_temp = (cur_temp - 0.1).max(0.1);
-                            runner.set_temperature(cur_temp);
-                        }
-                        KeyCode::Char('+') | KeyCode::Char('=') => {
-                            cur_temp = (cur_temp + 0.1).min(2.5);
-                            runner.set_temperature(cur_temp);
-                        }
-                        KeyCode::Char(',') | KeyCode::Char('<') => {
-                            cur_topk = cur_topk.saturating_sub(5).max(5);
-                            runner.set_top_k(cur_topk);
-                        }
-                        KeyCode::Char('.') | KeyCode::Char('>') => {
-                            cur_topk = (cur_topk + 5).min(200);
-                            runner.set_top_k(cur_topk);
-                        }
-                        KeyCode::Char('d') => {
-                            cur_cfg_drums = (cur_cfg_drums - 0.5).max(0.0);
-                            runner.set_cfg_drums(cur_cfg_drums);
-                        }
-                        KeyCode::Char('f') => {
-                            cur_cfg_drums = (cur_cfg_drums + 0.5).min(10.0);
-                            runner.set_cfg_drums(cur_cfg_drums);
-                        }
-                        KeyCode::Char('v') => {
-                            cur_volume_db = (cur_volume_db - 2.0).max(-60.0);
-                            runner.set_volume_db(cur_volume_db);
-                        }
-                        KeyCode::Char('b') => {
-                            cur_volume_db = (cur_volume_db + 2.0).min(12.0);
-                            runner.set_volume_db(cur_volume_db);
-                        }
-                        KeyCode::Char('g') => {
-                            cur_midi_gate = !cur_midi_gate;
-                            runner.set_midi_gate(cur_midi_gate);
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -917,7 +978,7 @@ fn run_tui_dashboard(
             let dropped = last_dropped;
             let spark_data: Vec<u64> = trans_history.iter().copied().collect();
             let resets_count = resets;
-            let prompt_ref = prompt;
+            let prompt_ref = current_prompt.as_str();
             let model_ref = model_display.as_str();
             let audio_ref = audio_format.as_str();
 
@@ -1018,6 +1079,8 @@ fn run_tui_dashboard(
                         Span::raw("Volume"),
                     ]),
                     Line::from(vec![
+                        Span::styled("  p / / ", Style::default().fg(Color::Yellow)),
+                        Span::raw("Edit Prompt Mid-play  "),
                         Span::styled("  g     ", Style::default().fg(Color::Yellow)),
                         Span::raw("Toggle MIDI Gate  "),
                         Span::styled("  r     ", Style::default().fg(Color::Yellow)),
@@ -1031,6 +1094,35 @@ fn run_tui_dashboard(
                 let help = Paragraph::new(help_lines)
                     .block(Block::default().borders(Borders::ALL).title(" Interactive Playback Controls "));
                 f.render_widget(help, rows[4]);
+
+                // ── Floating popup input box (drawn only in input mode) ────
+                if input_mode {
+                    let popup_area = centered_rect(65, 20, area);
+                    let popup_block = Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Edit Style Prompt ")
+                        .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+                    let popup_text = vec![
+                        Line::from(vec![
+                            Span::styled("Type a new prompt and press ", Style::default()),
+                            Span::styled("Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                            Span::styled(" to apply & reset context, or ", Style::default()),
+                            Span::styled("ESC", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                            Span::styled(" to cancel.", Style::default()),
+                        ]),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled("> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                            Span::raw(&input_string),
+                        ]),
+                    ];
+                    let popup = Paragraph::new(popup_text)
+                        .block(popup_block)
+                        .wrap(Wrap { trim: true });
+                    
+                    f.render_widget(Clear, popup_area); // Clears background area
+                    f.render_widget(popup, popup_area);
+                }
             })?;
         }
         Ok(())
