@@ -4,6 +4,8 @@ Welcome to the Magenta Players monorepo! This repository is designed to host mul
 
 <img width="959" height="849" alt="Image" src="https://github.com/user-attachments/assets/ce5d32cd-9056-4e72-96db-af1a4c332c6a" />
 
+<img width="1113" height="716" alt="Image" src="https://github.com/user-attachments/assets/754bac4d-96d6-4b6d-9b9f-8fab235908d8" />
+
 ## Monorepo Layout
 
 Currently, this repository hosts:
