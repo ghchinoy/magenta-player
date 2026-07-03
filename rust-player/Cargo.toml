@@ -36,6 +36,9 @@ crossterm = "0.28"
 # Low-level libc for redirecting the C++ engine's raw stdout during the TUI
 libc = "0.2"
 
+# Lock-free SPSC ring buffer for real-time audio visualization tapping
+ringbuf = "0.4"
+
 # Audio level utilities and standard serialization/logging
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

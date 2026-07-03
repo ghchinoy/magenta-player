@@ -5,6 +5,10 @@ use crate::ffi::ffi;
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::Stream;
 use std::sync::Arc;
+use ringbuf::{traits::*, HeapRb};
+
+/// Type alias for the lock-free SPSC audio sample consumer.
+pub type AudioConsumer = ringbuf::CachingCons<std::sync::Arc<ringbuf::SharedRb<ringbuf::storage::Heap<f32>>>>;
 
 /// Opens the default output device, preferring a native 48 kHz stereo stream
 /// (MRT2's native rate), and builds an output stream that pulls stereo samples
@@ -12,11 +16,12 @@ use std::sync::Arc;
 /// to 44.1 kHz), a real-time, lock-free, boundary-safe linear resampler is used
 /// so playback stays at the correct pitch/speed.
 ///
-/// Returns the started-elsewhere `Stream` (caller must `.play()`) and a human
-/// readable "N channels, R Hz" string for display.
+/// Returns the started-elsewhere `Stream`, a human readable "N channels, R Hz"
+/// string for display, and a lock-free consumer handle to tap live audio
+/// samples for real-time visualization.
 pub fn build_output_stream(
     runner: &Arc<cxx::UniquePtr<ffi::RealtimeRunnerBridge>>,
-) -> (Stream, String) {
+) -> (Stream, String, AudioConsumer) {
     println!("Opening default audio output device...");
     let host = cpal::default_host();
     let device = host
@@ -64,6 +69,11 @@ pub fn build_output_stream(
     let mut last_sample_l = 0.0f32;
     let mut last_sample_r = 0.0f32;
 
+    // Create a lock-free SPSC ring buffer for tapping live output audio samples
+    // (size is 2048, enough to hold a few blocks of stereo samples).
+    let rb = HeapRb::<f32>::new(2048);
+    let (mut prod, cons) = rb.split();
+
     let runner_clone = Arc::clone(runner);
     let stream = device
         .build_output_stream(
@@ -80,6 +90,11 @@ pub fn build_output_stream(
                         frame[0] = left[i];
                         frame[1] = right[i];
                     }
+                    
+                    // Tap a mono sum of the samples into our lock-free SPSC ring buffer for visualization.
+                    // If the ring is full, push_slice will push as many as fit (non-blocking).
+                    let mono: Vec<f32> = left.iter().zip(right.iter()).map(|(l, r)| (l + r) * 0.5).collect();
+                    prod.push_slice(&mono);
                 } else {
                     // High-fidelity, lock-free real-time linear resampler.
                     // Boundary-safe: keeps memory of the very last sample of the prior
@@ -111,6 +126,7 @@ pub fn build_output_stream(
                     }
 
                     // Resample and interleave directly into the hardware output buffer
+                    let mut mono = vec![0.0f32; num_frames];
                     for i in 0..num_frames {
                         let src_pos = src_accum + i as f64 * ratio;
                         let idx = src_pos.floor() as usize;
@@ -121,7 +137,13 @@ pub fn build_output_stream(
 
                         data[i * 2] = out_l;
                         data[i * 2 + 1] = out_r;
+                        
+                        // Tap a mono sum of the resampled samples
+                        mono[i] = (out_l + out_r) * 0.5;
                     }
+                    
+                    // Tap to SPSC ring buffer for visualization (non-blocking)
+                    prod.push_slice(&mono);
 
                     // Store fractional accumulator offset for the next callback block
                     src_accum = next_src_pos - consumed_inputs as f64;
@@ -132,7 +154,7 @@ pub fn build_output_stream(
         )
         .expect("❌ Error: Failed to build CPAL audio output stream");
 
-    (stream, audio_format_line)
+    (stream, audio_format_line, cons)
 }
 
 /// Records `seconds` of audio from the engine's internal recording buffer and

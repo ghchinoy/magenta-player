@@ -226,7 +226,7 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     let runner = Arc::new(runner_unique);
 
     // 6. Open the audio device and build the output stream (with resampler if needed)
-    let (stream, audio_format_line) = audio::build_output_stream(&runner);
+    let (stream, audio_format_line, audio_consumer) = audio::build_output_stream(&runner);
 
     // 7. Start the real-time audio playback stream
     use cpal::traits::StreamTrait;
@@ -256,7 +256,7 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     //     CI, log files) so we never corrupt non-terminal output streams.
     use std::io::IsTerminal;
     if std::io::stdout().is_terminal() {
-        tui::run_tui_dashboard(&runner, effective_config, &model_path, audio_format_line);
+        tui::run_tui_dashboard(&runner, effective_config, &model_path, audio_format_line, audio_consumer);
     } else {
         println!("\n[INFO] Playback running. Press Ctrl+C to stop.");
         let mut count = 0;

@@ -1,8 +1,10 @@
 //! Interactive TUI dashboard (ratatui + crossterm): live metrics, parameter
 //! steering, prompt editing, and explicit config save.
 
+use crate::audio::AudioConsumer;
 use crate::config::{save_config, AppConfig};
 use crate::ffi::ffi;
+use ringbuf::traits::*;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -13,7 +15,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline, Wrap},
+    widgets::{canvas::{Canvas, Line as CanvasLine}, Block, Borders, Clear, Gauge, Paragraph, Sparkline, Wrap},
     Terminal,
 };
 use std::collections::VecDeque;
@@ -97,6 +99,7 @@ pub fn run_tui_dashboard(
     base_config: AppConfig,
     model_path: &Option<String>,
     audio_format: String,
+    mut audio_consumer: AudioConsumer,
 ) {
     // Render the TUI through an explicit /dev/tty handle rather than stdout. This
     // lets us redirect the process's fd 1 (stdout) to /dev/null for the session
@@ -124,6 +127,9 @@ pub fn run_tui_dashboard(
     let mut trans_history: VecDeque<u64> = VecDeque::with_capacity(120);
     let session_start = std::time::Instant::now();
 
+    // Rolling queue of live audio samples for the oscilloscope visualizer (512 samples)
+    let mut oscillo_buffer: VecDeque<f32> = VecDeque::from(vec![0.0f32; 512]);
+
     let mut last_trans_ms = 0.0f64;
     let mut last_dropped: u64 = 0;
     let mut resets: u32 = 0;
@@ -143,6 +149,9 @@ pub fn run_tui_dashboard(
     // Input mode for changing style prompt mid-playback
     let mut input_mode = false;
     let mut input_string = String::new();
+
+    // Visualizer display mode: 0 = Side-by-Side, 1 = Sparkline Only, 2 = Oscilloscope Only
+    let mut visualizer_mode = 0;
 
     // Transient status message shown in the title bar (e.g. after saving config)
     let mut status_message: Option<(String, std::time::Instant)> = None;
@@ -265,6 +274,10 @@ pub fn run_tui_dashboard(
                                 cur_midi_gate = !cur_midi_gate;
                                 runner.set_midi_gate(cur_midi_gate);
                             }
+                            // Toggle visualizer panel layout (Side-by-side, Sparkline-only, Oscilloscope-only)
+                            KeyCode::Char('w') => {
+                                visualizer_mode = (visualizer_mode + 1) % 3;
+                            }
                             // Explicitly persist the current live params to config.toml.
                             // Preserves the non-TUI-adjustable fields (model,
                             // resources, output_dir, cfg_notes, drumless) from
@@ -286,6 +299,18 @@ pub fn run_tui_dashboard(
                             }
                             _ => {}
                         }
+                    }
+                }
+            }
+
+            // Pop live audio samples from CPAL consumer at 30 Hz for butter-smooth TUI animation
+            let mut temp_buf = vec![0.0f32; 1024];
+            let num_read = audio_consumer.pop_slice(&mut temp_buf);
+            if num_read > 0 {
+                for s in &temp_buf[0..num_read] {
+                    oscillo_buffer.push_back(*s);
+                    if oscillo_buffer.len() > 512 {
+                        oscillo_buffer.pop_front();
                     }
                 }
             }
@@ -395,15 +420,56 @@ pub fn run_tui_dashboard(
                     .label(gauge_label);
                 f.render_widget(gauge, rows[1]);
 
-                // ── Sparkline ───────────────────────────────────────────────
-                let spark_label = format!(" Transformer ms (last {} samples, full width) ", max_history_size);
+                // ── Flexible Visualizer Panel ────────────────────────────────
+                // We peak-normalize the most recent 512 samples in our ring buffer
+                // so the trace looks highly detailed and responsive at any volume,
+                // matching NoctaVox's design.
+                let samples: Vec<f32> = oscillo_buffer.iter().copied().collect();
+                let peak = samples.iter().map(|s| s.abs()).max_by(|a, b| a.total_cmp(b)).unwrap_or(1.0);
+                let scale = if peak > 0.01 { 0.95 / peak } else { 1.0 }; // 5% padding on top/bottom
+                
+                let canvas = Canvas::default()
+                    .block(Block::default().borders(Borders::ALL).title(" Real-time Oscilloscope (PCM Trace) "))
+                    .x_bounds([0.0, samples.len() as f64])
+                    .y_bounds([-1.0, 1.0])
+                    .paint(move |ctx| {
+                        for i in 0..samples.len().saturating_sub(1) {
+                            ctx.draw(&CanvasLine {
+                                x1: i as f64,
+                                y1: (samples[i] * scale) as f64,
+                                x2: (i + 1) as f64,
+                                y2: (samples[i + 1] * scale) as f64,
+                                color: Color::Cyan, // beautiful glowing cyan trace!
+                            });
+                        }
+                    });
+
+                let spark_label = format!(" Transformer ms (last {} samples) ", max_history_size);
                 let spark = Sparkline::default()
-                    .block(Block::default()
-                        .borders(Borders::ALL)
-                        .title(spark_label))
+                    .block(Block::default().borders(Borders::ALL).title(spark_label))
                     .style(Style::default().fg(latency_color))
                     .data(&spark_data);
-                f.render_widget(spark, rows[2]);
+
+                match visualizer_mode {
+                    0 => {
+                        // Side-by-side split
+                        let columns = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                            .split(rows[2]);
+                        f.render_widget(spark, columns[0]);
+                        f.render_widget(canvas, columns[1]);
+                    }
+                    1 => {
+                        // Sparkline only (fills the full box)
+                        f.render_widget(spark, rows[2]);
+                    }
+                    2 => {
+                        // Oscilloscope only (fills the full box)
+                        f.render_widget(canvas, rows[2]);
+                    }
+                    _ => {}
+                }
 
                 // ── Key help bar ────────────────────────────────────────────
                 let help_lines = vec![
@@ -422,8 +488,12 @@ pub fn run_tui_dashboard(
                     Line::from(vec![
                         Span::styled("  p / / ", Style::default().fg(Color::Yellow)),
                         Span::raw("Edit Prompt Mid-play  "),
+                        Span::styled("  w     ", Style::default().fg(Color::Yellow)),
+                        Span::raw("Cycle Visualizers  "),
                         Span::styled("  g     ", Style::default().fg(Color::Yellow)),
-                        Span::raw("Toggle MIDI Gate  "),
+                        Span::raw("Toggle MIDI Gate"),
+                    ]),
+                    Line::from(vec![
                         Span::styled("  r     ", Style::default().fg(Color::Yellow)),
                         Span::raw("Reset Audio Context (re-anchors to prompt)"),
                     ]),

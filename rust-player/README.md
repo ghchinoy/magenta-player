@@ -236,7 +236,7 @@ When running interactively (attached to a real terminal), `play` launches a live
 |---|---|
 | **Session info** | Model, prompt, params (temperature/top-k/CFGs), audio format, uptime, reset count |
 | **Frame budget gauge** | Transformer latency vs 40ms real-time budget, traffic-light coloured (green < 30ms / yellow < 40ms / red over-budget) |
-| **Sparkline** | Rolling 60-sample history of transformer latency (ms) |
+| **Visualizer split** | Side-by-side Horizontal split: (Left) Rolling history of transformer latency; (Right) Real-time glowing cyan Audio Oscilloscope PCM trace. |
 | **Controls bar** | Keyboard shortcuts |
 
 **Keyboard controls (interactive only):**
@@ -251,6 +251,7 @@ When running interactively (attached to a real terminal), `play` launches a live
   * `g`         — Toggle **MIDI Gate** on/off
 * **Session Lifecycle**:
   * `r`         — Trigger **audio context reset** mid-playback (re-anchors generation immediately to the current prompt with no audio gap)
+  * `w`         — **Cycle visualizer layouts** (0 = Side-by-Side Split, 1 = Sparkline Only, 2 = Oscilloscope Only) to allow full-screen waveforms
   * `S`         — **Save** the current live parameters (prompt, prompt strength, temperature, top-k, drums CFG, volume, MIDI gate) back to `config.toml`, so they become your defaults next launch. Non-TUI-only fields (model, resources, output_dir, cfg_notes, drumless) are preserved as-is. A confirmation appears briefly in the title bar.
   * `q` / `ESC` — Quit player cleanly and restore terminal
   * `Ctrl-C`   — Quit player cleanly and restore terminal

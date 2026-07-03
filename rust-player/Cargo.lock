@@ -362,6 +362,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-utils"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
 name = "crossterm"
 version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -924,6 +930,7 @@ dependencies = [
  "libc",
  "log",
  "ratatui",
+ "ringbuf",
  "serde",
  "serde_json",
  "toml",
@@ -1129,6 +1136,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
 
 [[package]]
+name = "portable-atomic-util"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618"
+dependencies = [
+ "portable-atomic",
+]
+
+[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1230,6 +1246,17 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "ringbuf"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe47b720588c8702e34b5979cb3271a8b1842c7cb6f57408efa70c779363488c"
+dependencies = [
+ "crossbeam-utils",
+ "portable-atomic",
+ "portable-atomic-util",
+]
 
 [[package]]
 name = "rustc-hash"
