@@ -240,9 +240,18 @@ When running interactively (attached to a real terminal), `play` launches a live
 | **Controls bar** | Keyboard shortcuts |
 
 **Keyboard controls (interactive only):**
-- `q` / `ESC` — quit
-- `Ctrl-C` — quit
-- `r` — trigger context reset mid-playback (re-anchors generation to the current prompt without stopping inference)
+* **Inference Parameters (Live Steering)**:
+  * `[` / `]` — Decrease / Increase **Prompt Strength** (`cfg_text`) by `0.5` (range: `1.0` - `10.0`)
+  * `-` / `+` — Decrease / Increase **Temperature** by `0.1` (range: `0.1` - `2.5`, `=` key works as `+` too)
+  * `,` / `.` — Decrease / Increase **Top-K** sampling by `5` (range: `5` - `200`, `<` / `>` work too)
+  * `d` / `f` — Decrease / Increase **Drums CFG** (`cfg_drums`) by `0.5` (range: `0.0` - `10.0`)
+* **Audio & MIDI**:
+  * `v` / `b` — Decrease / Increase **Volume** (`volume_db`) by `2.0` dB (range: `-60.0` - `12.0` dB)
+  * `g`         — Toggle **MIDI Gate** on/off
+* **Session Lifecycle**:
+  * `r`         — Trigger **audio context reset** mid-playback (re-anchors generation immediately to the current prompt with no audio gap)
+  * `q` / `ESC` — Quit player cleanly and restore terminal
+  * `Ctrl-C`   — Quit player cleanly and restore terminal
 
 Falls back to the plain scrolling metrics log when stdout is not a TTY (piped output, CI, log files, `--record` mode) — the TUI never corrupts non-terminal output streams.
 

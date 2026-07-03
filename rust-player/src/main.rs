@@ -30,16 +30,16 @@ mod ffi {
         fn create_runner() -> UniquePtr<RealtimeRunnerBridge>;
         fn init_assets(self: Pin<&mut RealtimeRunnerBridge>, resource_dir: &str) -> bool;
         fn load_model(self: Pin<&mut RealtimeRunnerBridge>, path: &str) -> bool;
-        fn set_prompt(self: Pin<&mut RealtimeRunnerBridge>, prompt: &str);
-        fn set_temperature(self: Pin<&mut RealtimeRunnerBridge>, temp: f32);
-        fn set_top_k(self: Pin<&mut RealtimeRunnerBridge>, k: u32);
-        fn set_midi_gate(self: Pin<&mut RealtimeRunnerBridge>, enabled: bool);
-        fn set_buffer_size(self: Pin<&mut RealtimeRunnerBridge>, cap: usize);
-        fn set_cfg_text(self: Pin<&mut RealtimeRunnerBridge>, v: f32);
-        fn set_cfg_notes(self: Pin<&mut RealtimeRunnerBridge>, v: f32);
-        fn set_cfg_drums(self: Pin<&mut RealtimeRunnerBridge>, v: f32);
-        fn set_drumless(self: Pin<&mut RealtimeRunnerBridge>, on: bool);
-        fn set_volume_db(self: Pin<&mut RealtimeRunnerBridge>, v: f32);
+        fn set_prompt(self: &RealtimeRunnerBridge, prompt: &str);
+        fn set_temperature(self: &RealtimeRunnerBridge, temp: f32);
+        fn set_top_k(self: &RealtimeRunnerBridge, k: u32);
+        fn set_midi_gate(self: &RealtimeRunnerBridge, enabled: bool);
+        fn set_buffer_size(self: &RealtimeRunnerBridge, cap: usize);
+        fn set_cfg_text(self: &RealtimeRunnerBridge, v: f32);
+        fn set_cfg_notes(self: &RealtimeRunnerBridge, v: f32);
+        fn set_cfg_drums(self: &RealtimeRunnerBridge, v: f32);
+        fn set_drumless(self: &RealtimeRunnerBridge, on: bool);
+        fn set_volume_db(self: &RealtimeRunnerBridge, v: f32);
         fn toggle_play(self: &RealtimeRunnerBridge, playing: bool);
         fn get_quantizer_status(self: &RealtimeRunnerBridge) -> i32;
         fn read_audio_stereo(
@@ -498,16 +498,16 @@ fn run_player(config: AppConfig, args: PlayArgs) {
         eprintln!("         Check --resources / `config set resources <path>` points at magenta-rt-v2/resources.");
     }
 
-    // 3. Set the initial generation parameters (now that assets are loaded, set_prompt can actually encode):
-    runner_unique.pin_mut().set_prompt(&prompt);
-    runner_unique.pin_mut().set_temperature(temperature);
-    runner_unique.pin_mut().set_top_k(topk);
-    runner_unique.pin_mut().set_midi_gate(midi_gate);
-    runner_unique.pin_mut().set_cfg_text(cfg_text);
-    runner_unique.pin_mut().set_cfg_notes(cfg_notes);
-    runner_unique.pin_mut().set_cfg_drums(cfg_drums);
-    runner_unique.pin_mut().set_drumless(drumless);
-    runner_unique.pin_mut().set_volume_db(volume_db);
+    // 3. Set the initial generation parameters FIRST so they are ready on startup:
+    runner_unique.set_prompt(&prompt);
+    runner_unique.set_temperature(temperature);
+    runner_unique.set_top_k(topk);
+    runner_unique.set_midi_gate(midi_gate);
+    runner_unique.set_cfg_text(cfg_text);
+    runner_unique.set_cfg_notes(cfg_notes);
+    runner_unique.set_cfg_drums(cfg_drums);
+    runner_unique.set_drumless(drumless);
+    runner_unique.set_volume_db(volume_db);
     
     // Set ring buffer virtual capacity to 8192 samples (RingBuffer::kCapacity, the
     // physical maximum, ~170ms/4 frames at 48kHz). docs/realtime-audio.md and
@@ -517,7 +517,7 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     // *jitter*-caused drops -- if dropped_frames still grows unbounded, that's a
     // genuine hardware throughput limit no buffer size can fix (switch to mrt2_small).
     println!("Configuring C++ ring buffer size to 8192 samples (max, ~170ms headroom)...");
-    runner_unique.pin_mut().set_buffer_size(8192);
+    runner_unique.set_buffer_size(8192);
 
     // 4. Load the model if provided:
     if let Some(ref path_str) = model_path {
@@ -791,14 +791,21 @@ fn run_tui_dashboard(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).expect("❌ Failed to create terminal");
 
-    // History ring for sparkline (30 datapoints ~ 1s at 33 Hz draw rate)
-    const HIST: usize = 60;
-    let mut trans_history: VecDeque<u64> = VecDeque::with_capacity(HIST);
+    // Dynamic history ring for sparkline (will be resized on draw ticks to match terminal columns)
+    let mut trans_history: VecDeque<u64> = VecDeque::with_capacity(120);
     let session_start = std::time::Instant::now();
 
     let mut last_trans_ms = 0.0f64;
     let mut last_dropped: u64 = 0;
     let mut resets: u32 = 0;
+
+    // Mutably track live-adjusted parameters so they reflect in the TUI in real time
+    let mut cur_temp = temperature;
+    let mut cur_topk = topk;
+    let mut cur_cfg_text = cfg_text;
+    let mut cur_cfg_drums = cfg_drums;
+    let mut cur_volume_db = 0.0f32; // CPAL output gain DB defaults to 0.0
+    let mut cur_midi_gate = false; // MIDI gate starts false by default unless overridden
 
     let model_display = model_path
         .as_deref()
@@ -813,16 +820,76 @@ fn run_tui_dashboard(
 
     let result = (|| -> std::io::Result<()> {
         loop {
+            // Query dynamic terminal width to adjust sparkline history size
+            let max_history_size = if let Ok(sz) = terminal.size() {
+                // The sparkline block width minus borders
+                (sz.width as usize).saturating_sub(2).max(10)
+            } else {
+                60
+            };
+
+            // Keep history trimmed to the dynamic column width
+            while trans_history.len() > max_history_size {
+                trans_history.pop_front();
+            }
+
             // Poll crossterm events (non-blocking)
             if event::poll(draw_tick)? {
                 if let Event::Key(key) = event::read()? {
                     match key.code {
+                        // Lifecycle
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                         KeyCode::Char('r') => {
                             runner.toggle_play(true);
                             runner.reset_dropped_frames();
                             resets += 1;
+                        }
+                        
+                        // Interactive Parameter Adjustments (steers C++ runner atomically!)
+                        KeyCode::Char('[') => {
+                            cur_cfg_text = (cur_cfg_text - 0.5).max(1.0);
+                            runner.set_cfg_text(cur_cfg_text);
+                        }
+                        KeyCode::Char(']') => {
+                            cur_cfg_text = (cur_cfg_text + 0.5).min(10.0);
+                            runner.set_cfg_text(cur_cfg_text);
+                        }
+                        KeyCode::Char('-') => {
+                            cur_temp = (cur_temp - 0.1).max(0.1);
+                            runner.set_temperature(cur_temp);
+                        }
+                        KeyCode::Char('+') | KeyCode::Char('=') => {
+                            cur_temp = (cur_temp + 0.1).min(2.5);
+                            runner.set_temperature(cur_temp);
+                        }
+                        KeyCode::Char(',') | KeyCode::Char('<') => {
+                            cur_topk = cur_topk.saturating_sub(5).max(5);
+                            runner.set_top_k(cur_topk);
+                        }
+                        KeyCode::Char('.') | KeyCode::Char('>') => {
+                            cur_topk = (cur_topk + 5).min(200);
+                            runner.set_top_k(cur_topk);
+                        }
+                        KeyCode::Char('d') => {
+                            cur_cfg_drums = (cur_cfg_drums - 0.5).max(0.0);
+                            runner.set_cfg_drums(cur_cfg_drums);
+                        }
+                        KeyCode::Char('f') => {
+                            cur_cfg_drums = (cur_cfg_drums + 0.5).min(10.0);
+                            runner.set_cfg_drums(cur_cfg_drums);
+                        }
+                        KeyCode::Char('v') => {
+                            cur_volume_db = (cur_volume_db - 2.0).max(-60.0);
+                            runner.set_volume_db(cur_volume_db);
+                        }
+                        KeyCode::Char('b') => {
+                            cur_volume_db = (cur_volume_db + 2.0).min(12.0);
+                            runner.set_volume_db(cur_volume_db);
+                        }
+                        KeyCode::Char('g') => {
+                            cur_midi_gate = !cur_midi_gate;
+                            runner.set_midi_gate(cur_midi_gate);
                         }
                         _ => {}
                     }
@@ -839,7 +906,7 @@ fn run_tui_dashboard(
                 }
                 let sparkval = last_trans_ms.round() as u64;
                 trans_history.push_back(sparkval);
-                if trans_history.len() > HIST {
+                if trans_history.len() > max_history_size {
                     trans_history.pop_front();
                 }
             }
@@ -871,11 +938,11 @@ fn run_tui_dashboard(
                 let rows = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(6),  // session info
+                        Constraint::Length(7),  // session info
                         Constraint::Length(4),  // budget gauge
                         Constraint::Length(8),  // sparkline
                         Constraint::Min(0),     // spacer
-                        Constraint::Length(3),  // key help
+                        Constraint::Length(5),  // keyboard control help panel
                     ])
                     .split(area);
 
@@ -890,13 +957,13 @@ fn run_tui_dashboard(
                         Span::raw(format!("\"{}\"", prompt_ref)),
                     ]),
                     Line::from(vec![
-                        Span::styled("  Params   ", Style::default().add_modifier(Modifier::BOLD)),
-                        Span::raw(format!("temp {:.1}  top-k {}  cfg-text {:.1}  cfg-drums {:.1}",
-                            temperature, topk, cfg_text, cfg_drums)),
+                        Span::styled("  Tuning   ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(format!("PromptStrength: {:.1}  Temp: {:.1}  TopK: {}  DrumsCFG: {:.1}  MidiGate: {}",
+                            cur_cfg_text, cur_temp, cur_topk, cur_cfg_drums, if cur_midi_gate { "Enabled" } else { "Disabled" })),
                     ]),
                     Line::from(vec![
-                        Span::styled("  Audio    ", Style::default().add_modifier(Modifier::BOLD)),
-                        Span::raw(audio_ref),
+                        Span::styled("  Output   ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(format!("Volume: {:.1} dB  (Device: {})", cur_volume_db, audio_ref)),
                     ]),
                     Line::from(vec![
                         Span::styled("  Uptime   ", Style::default().add_modifier(Modifier::BOLD)),
@@ -927,24 +994,42 @@ fn run_tui_dashboard(
                 f.render_widget(gauge, rows[1]);
 
                 // ── Sparkline ───────────────────────────────────────────────
+                let spark_label = format!(" Transformer ms (last {} samples, full width) ", max_history_size);
                 let spark = Sparkline::default()
                     .block(Block::default()
                         .borders(Borders::ALL)
-                        .title(" Transformer ms (last 60 samples) "))
+                        .title(spark_label))
                     .style(Style::default().fg(latency_color))
                     .data(&spark_data);
                 f.render_widget(spark, rows[2]);
 
                 // ── Key help bar ────────────────────────────────────────────
-                let help = Paragraph::new(Line::from(vec![
-                    Span::styled("  q / ESC ", Style::default().fg(Color::Yellow)),
-                    Span::raw("quit    "),
-                    Span::styled("  r ", Style::default().fg(Color::Yellow)),
-                    Span::raw("reset audio context (re-anchors to prompt)    "),
-                    Span::styled("  Ctrl-C ", Style::default().fg(Color::Yellow)),
-                    Span::raw("quit"),
-                ]))
-                .block(Block::default().borders(Borders::ALL).title(" Controls "));
+                let help_lines = vec![
+                    Line::from(vec![
+                        Span::styled("  [ / ] ", Style::default().fg(Color::Yellow)),
+                        Span::raw("Prompt Strength  "),
+                        Span::styled("  - / + ", Style::default().fg(Color::Yellow)),
+                        Span::raw("Temp  "),
+                        Span::styled("  , / . ", Style::default().fg(Color::Yellow)),
+                        Span::raw("TopK  "),
+                        Span::styled("  d / f ", Style::default().fg(Color::Yellow)),
+                        Span::raw("Drums CFG  "),
+                        Span::styled("  v / b ", Style::default().fg(Color::Yellow)),
+                        Span::raw("Volume"),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  g     ", Style::default().fg(Color::Yellow)),
+                        Span::raw("Toggle MIDI Gate  "),
+                        Span::styled("  r     ", Style::default().fg(Color::Yellow)),
+                        Span::raw("Reset Audio Context (re-anchors to prompt)"),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  q/ESC ", Style::default().fg(Color::Red)),
+                        Span::raw("Quit Player"),
+                    ]),
+                ];
+                let help = Paragraph::new(help_lines)
+                    .block(Block::default().borders(Borders::ALL).title(" Interactive Playback Controls "));
                 f.render_widget(help, rows[4]);
             })?;
         }

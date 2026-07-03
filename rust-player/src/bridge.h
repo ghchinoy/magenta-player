@@ -29,61 +29,71 @@ public:
         return runner_->init_assets(dir_str.c_str());
     }
 
-    void set_prompt(rust::Str prompt) {
+    void set_prompt(rust::Str prompt) const {
+        auto* r = const_cast<magentart::core::RealtimeRunner*>(runner_.get());
         std::string prompt_str(prompt.data(), prompt.size());
         std::vector<std::string> prompts = { prompt_str };
         std::vector<float> weights = { 1.0f };
-        runner_->set_text_prompts(prompts, weights);
+        r->set_text_prompts(prompts, weights);
         
         // Explicitly set blend weights for the CLI player so that our custom
         // prompt (slot 0) has 100% weight, and slots 1, 2, and 3 are completely zeroed out.
         // This overrides RealtimeRunner's default 2D surface mode (which blends 50% of
         // slot 0 and 50% of slot 1, causing the custom prompt to be diluted with 50% of 
         // the default empty/piano prompt).
-        runner_->set_blend_weight(0, 1.0f);
-        runner_->set_blend_weight(1, 0.0f);
-        runner_->set_blend_weight(2, 0.0f);
-        runner_->set_blend_weight(3, 0.0f);
+        r->set_blend_weight(0, 1.0f);
+        r->set_blend_weight(1, 0.0f);
+        r->set_blend_weight(2, 0.0f);
+        r->set_blend_weight(3, 0.0f);
     }
 
-    void set_temperature(float temp) {
-        runner_->set_temperature(temp);
+    void set_temperature(float temp) const {
+        auto* r = const_cast<magentart::core::RealtimeRunner*>(runner_.get());
+        r->set_temperature(temp);
     }
 
-    void set_top_k(uint32_t k) {
-        runner_->set_top_k(k);
+    void set_top_k(uint32_t k) const {
+        auto* r = const_cast<magentart::core::RealtimeRunner*>(runner_.get());
+        r->set_top_k(k);
     }
 
-    void set_midi_gate(bool enabled) {
-        runner_->set_midi_gate_enabled(enabled);
+    void set_midi_gate(bool enabled) const {
+        auto* r = const_cast<magentart::core::RealtimeRunner*>(runner_.get());
+        r->set_midi_gate_enabled(enabled);
     }
 
-    void set_buffer_size(size_t cap) {
-        runner_->set_buffer_size(cap);
+    void set_buffer_size(size_t cap) const {
+        auto* r = const_cast<magentart::core::RealtimeRunner*>(runner_.get());
+        r->set_buffer_size(cap);
     }
 
     // CFG (classifier-free guidance) weights control how strongly each
     // conditioning signal steers generation. Higher = more strongly
     // adherent to that signal, at some cost to naturalness/diversity.
     // Factory defaults: text=3.0, notes=5.0, drums=1.0.
-    void set_cfg_text(float v) {
-        runner_->set_cfg_musiccoca(v);
+    void set_cfg_text(float v) const {
+        auto* r = const_cast<magentart::core::RealtimeRunner*>(runner_.get());
+        r->set_cfg_musiccoca(v);
     }
 
-    void set_cfg_notes(float v) {
-        runner_->set_cfg_notes(v);
+    void set_cfg_notes(float v) const {
+        auto* r = const_cast<magentart::core::RealtimeRunner*>(runner_.get());
+        r->set_cfg_notes(v);
     }
 
-    void set_cfg_drums(float v) {
-        runner_->set_cfg_drums(v);
+    void set_cfg_drums(float v) const {
+        auto* r = const_cast<magentart::core::RealtimeRunner*>(runner_.get());
+        r->set_cfg_drums(v);
     }
 
-    void set_drumless(bool on) {
-        runner_->set_drumless(on);
+    void set_drumless(bool on) const {
+        auto* r = const_cast<magentart::core::RealtimeRunner*>(runner_.get());
+        r->set_drumless(on);
     }
 
-    void set_volume_db(float v) {
-        runner_->set_volume_db(v);
+    void set_volume_db(float v) const {
+        auto* r = const_cast<magentart::core::RealtimeRunner*>(runner_.get());
+        r->set_volume_db(v);
     }
 
     void toggle_play(bool playing) const {
