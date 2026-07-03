@@ -161,6 +161,113 @@ trigger_reset()
 start()
 ```
 
+## CRITICAL: Never Call `load_model` While Playing — SIGSEGV
+
+`load_model()` does **not** pause a running inference thread for you. If
+called while the engine is actively playing (inference thread running on its
+own OS thread, executing `mlx::core` ops at 25 Hz), `load_model()` reassigns
+model weight tensors on the calling thread **while the inference thread is
+mid-read on the old ones**. This is a real, reproducible crash — confirmed
+three times via macOS crash reports (`~/Library/Logs/DiagnosticReports/`),
+identical signature every time:
+
+```
+EXC_BAD_ACCESS / SIGSEGV at 0x0000000000000008  (null-pointer dereference)
+
+mlx::core::scheduler::Scheduler::get_default_stream(Device const&) const
+mlx::core::default_stream(Device)
+mlx::core::to_stream(variant<monostate, Stream, Device>)
+mlx::core::add(array const&, array const&, ...)
+magentart::core::RealtimeRunner::inference_loop()
+```
+
+The crash happens **inside the inference thread**, not inside `load_model()`
+itself — proof this is a race between the two threads on shared MLX state,
+not a bug in the loaded file.
+
+**The fix is entirely on the caller side — stop before you load:**
+
+```cpp
+if (runner->is_playing()) {   // or your own tracked play state
+    runner->stop();           // synchronous — blocks until inference thread joins
+}
+runner->load_model(new_path);
+```
+
+```swift
+// Swift bridge equivalent
+if state.isPlaying {
+    stop()   // magentart_stop() — synchronous, joins the inference thread
+}
+magentart_load_model(ref, path)
+```
+
+**Where this bites you in a real UI:** any "Load Model" or "Download Model"
+button that is clickable while music is already playing. If your UI doesn't
+disable those buttons during playback, guard the *load* call itself — don't
+rely on UI state alone, since programmatic load paths (e.g. auto-load after
+an in-app download completes) can bypass button-disabled checks entirely.
+
+`RealtimeRunner::stop()` is documented as synchronous and mutex-serialized
+against other lifecycle calls, so calling it immediately before `load_model()`
+on the same thread is safe and sufficient — no additional delay or polling
+needed.
+
+## `load_model` Auto-Starts the Inference Thread — Undocumented
+
+The header (`realtime_runner.h`) declares `load_model` with no mention of side
+effects beyond loading weights. The implementation
+(`core/src/realtime_runner.cpp:68-73`) tells a different story:
+
+```cpp
+bool RealtimeRunner::load_model(const char* mlxfn_path) {
+    ...
+    bool success = engine_.load_model(mlxfn_path);
+    if (success) start_locked();   // <-- auto-starts the inference thread
+    return success;
+}
+```
+
+**`load_model()` starts inference on success, unconditionally.** Combined with
+`bypass_` defaulting to `false` on a freshly-constructed engine, this means:
+the instant `load_model()` returns `true`, audio is already being generated
+and is **not** silenced. If your host app's UI has a separate "Play" concept
+tracked in its own state (as most players do), you get exactly this bug:
+**sound plays immediately after loading a model, while the Play/Pause button
+still shows "Play"** — the UI's play state was never told anything started.
+
+**Fix — stop immediately after a successful load, before showing the model as
+ready:**
+
+```cpp
+if (runner->load_model(path)) {
+    runner->stop();     // undo the auto-start; wait for explicit Play
+    // update UI: model loaded, not playing
+}
+```
+
+```swift
+// Swift bridge equivalent
+if magentart_load_model(ref, path) {
+    stop()   // magentart_stop() + magentart_set_bypass(true)
+}
+```
+
+This is safe to call immediately — `stop_locked()` joins the auto-started
+thread synchronously, and the user's subsequent explicit Play does a full
+fresh `start_locked()` (with `reset_state()` and 3-frame priming) as normal.
+
+**Why this doesn't conflict with the "never load while playing" rule above:**
+`start_locked()` is itself safe to call re-entrantly — it stops any existing
+thread first (`if (thread_.joinable()) { running_ = false; thread_.join(); }`)
+before spawning a new one. The crash documented above happens specifically
+because `engine_.load_model()` (which reassigns weight tensors) runs **before**
+`start_locked()`'s own stop-the-old-thread logic — i.e. only when a thread from
+a *previous* `load_model`/`start` call is already running at the moment
+`load_model()` is invoked again. A fresh `load_model()` call with no prior
+playback has no old thread to race with, so its internal auto-start is
+threading-safe — just UI-state-inconsistent, which is what this section fixes.
+
 ## `load_model` Blocks for Several Seconds
 
 `load_model` compiles the MLX computation graph for the target Apple Silicon

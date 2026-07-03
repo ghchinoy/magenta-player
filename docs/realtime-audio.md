@@ -118,6 +118,33 @@ If the device reports 44.1 kHz and you write 48 kHz content without resampling:
   the audio render callback when `device_rate != 48_000`.
 - See `magenta-player-3vy.2` (bd issue) for the tracked implementation task.
 
+## TimelineView + Canvas: Always Capture `context.date`
+
+`TimelineView` ticks on schedule, but `Canvas` is a reference-type-aware
+SwiftUI primitive — it only re-executes its drawing closure if SwiftUI detects
+a change in its captured inputs. If all your inputs are reference types
+(e.g. a ring buffer `final class`), SwiftUI sees the same pointer on every
+tick and **caches the Canvas output**, producing a frozen display even though
+the underlying data is updating on the audio thread at 30+ fps.
+
+**Fix:** explicitly capture `context.date` inside the Canvas closure:
+
+```swift
+TimelineView(.animation(minimumInterval: 1.0 / 30)) { context in
+    Canvas { ctx, size in
+        _ = context.date   // ← this one line forces a redraw on every tick
+        let (snapL, snapR) = myRingBuffer.snapshot()
+        // ... draw ...
+    }
+}
+```
+
+`context.date` is a `Date` that changes on every tick. Capturing it inside
+the Canvas closure establishes a SwiftUI dependency on the timeline schedule,
+bypassing the reference-equality optimisation that otherwise freezes the view.
+This applies to any animated Canvas driven by mutable reference-type data —
+audio visualisers, live meters, scrolling plots, etc.
+
 ## Bypass-as-Pause: Implementing Pause Without Stopping Inference
 
 `set_bypass(true)` silences the output while the inference thread keeps

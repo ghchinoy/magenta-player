@@ -2,7 +2,9 @@ import SwiftUI
 
 struct PlayerView: View {
     @StateObject private var playerManager = PlayerManager()
-    @State private var showingAbout = false
+    @StateObject private var downloader    = ModelDownloader()
+    @State private var showingAbout    = false
+    @State private var showingDownload = false
 
     var body: some View {
         VStack(spacing: 20) {
@@ -12,10 +14,24 @@ struct PlayerView: View {
                 Text("Magenta RealTime")
                     .font(.largeTitle)
                     .fontWeight(.bold)
-                Text(playerManager.modelDescription)
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                    .animation(.easeInOut(duration: 0.2), value: playerManager.modelDescription)
+                HStack(spacing: 6) {
+                    Text(playerManager.modelDescription)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                    CompactIconButton(
+                        systemImage: "folder.badge.plus",
+                        help: "Load a Magenta RealTime model (⌘O)"
+                    ) {
+                        openModelPicker()
+                    }
+                    CompactIconButton(
+                        systemImage: "icloud.and.arrow.down",
+                        help: "Download a model from HuggingFace"
+                    ) {
+                        showingDownload = true
+                    }
+                }
+                .animation(.easeInOut(duration: 0.2), value: playerManager.modelDescription)
             }
             .padding(.top)
 
@@ -59,8 +75,6 @@ struct PlayerView: View {
                     ResetContextButton { playerManager.resetContext() }
                         .transition(.scale.combined(with: .opacity))
                 }
-
-                LoadModelButton { openModelPicker() }
             }
             .animation(.easeOut(duration: 0.15), value: playerManager.state.isPlaying)
             .animation(.easeOut(duration: 0.15), value: playerManager.state.isPaused)
@@ -80,6 +94,12 @@ struct PlayerView: View {
                 onVolumeChange: { playerManager.setVolume(playerManager.parameters.volume) },
                 onMuteToggle:   { playerManager.setMute(playerManager.parameters.mute) }
             )
+
+            // Rolling waveform visualiser
+            WaveformView(waveform: playerManager.waveform,
+                         isPlaying: playerManager.state.isGenerating)
+                .frame(height: 72)
+                .padding(.horizontal)
 
             Divider()
 
@@ -160,6 +180,16 @@ struct PlayerView: View {
                 version: playerManager.appVersion,
                 modelDescription: playerManager.modelDescription
             )
+        }
+        .sheet(isPresented: $showingDownload) {
+            DownloadModelSheet(downloader: downloader)
+        }
+        .onAppear {
+            // Wire once: when a download finishes, auto-load it and dismiss.
+            downloader.onComplete = { [weak playerManager] path in
+                playerManager?.loadModel(at: path)
+                showingDownload = false
+            }
         }
     }
 
@@ -260,33 +290,181 @@ struct StopButton: View {
     }
 }
 
-struct LoadModelButton: View {
+/// Small icon-only button, sized to sit inline with the model description
+/// text under the header. Used for Load Model and Download Model — both
+/// moved out of the main playback controls row so that row stays focused
+/// on transport (Play/Pause/Resume/Stop/Reset).
+struct CompactIconButton: View {
+    let systemImage: String
+    let help: String
     let action: () -> Void
     @State private var isHovering = false
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 8) {
-                Image(systemName: "folder.badge.plus")
-                    .font(.system(size: 20))
-                Text("Load Model")
-                    .font(.title3).fontWeight(.semibold)
-            }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 10)
-            .background(Color.accentColor)
-            .foregroundColor(.white)
-            .cornerRadius(10)
-            .shadow(radius: isHovering ? 6 : 3)
-            .scaleEffect(isHovering ? 1.03 : 1.0)
-            .animation(.easeOut(duration: 0.15), value: isHovering)
+            Image(systemName: systemImage)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(isHovering ? .accentColor : .secondary)
+                .frame(width: 22, height: 22)
+                .background(
+                    Circle().fill(isHovering ? Color.secondary.opacity(0.15) : Color.clear)
+                )
         }
         .buttonStyle(.plain)
         .onHover { hovering in
             isHovering = hovering
             if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
         }
-        .help("Load a Magenta RealTime model (⌘O)")
+        .help(help)
+    }
+}
+
+// MARK: - Download Model sheet
+
+private struct DownloadableModel: Identifiable {
+    let id: String          // "mrt2_small" / "mrt2_base"
+    let params: String
+    let hardware: String
+    let modelBytes: Int64   // combined .mlxfn + _state.safetensors
+}
+
+private let downloadableModels: [DownloadableModel] = [
+    .init(id: "mrt2_small", params: "230 M params",
+          hardware: "Any Apple Silicon", modelBytes: 464_331_548),
+    .init(id: "mrt2_base", params: "2.4 B params",
+          hardware: "M1 Pro / Max and above", modelBytes: 2_788_354_715),
+]
+
+private let resourcesBytes: Int64 = 1_375_741_343   // musiccoca + spectrostream, one-time
+
+private let byteFormatter: ByteCountFormatter = {
+    let f = ByteCountFormatter()
+    f.countStyle = .file
+    return f
+}()
+
+struct DownloadModelSheet: View {
+    @ObservedObject var downloader: ModelDownloader
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text("Download a Model")
+                .font(.title2).fontWeight(.bold)
+                .padding(.top, 24)
+            Text("From HuggingFace — google/magenta-realtime-2")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding(.bottom, 20)
+
+            if downloader.isDownloading {
+                downloadingView
+            } else {
+                modelList
+            }
+
+            Divider()
+            HStack {
+                if downloader.isDownloading {
+                    Button("Cancel") { downloader.cancel() }
+                } else {
+                    Button("Close") { dismiss() }
+                }
+                Spacer()
+            }
+            .padding()
+        }
+        .frame(width: 420)
+    }
+
+    private var modelList: some View {
+        VStack(spacing: 12) {
+            if !downloader.resourcesExist() {
+                Label(
+                    "First download also fetches \(byteFormatter.string(fromByteCount: resourcesBytes)) of shared codec resources (one-time).",
+                    systemImage: "info.circle"
+                )
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .padding(.horizontal)
+            }
+
+            ForEach(downloadableModels) { model in
+                ModelDownloadRow(
+                    model: model,
+                    alreadyDownloaded: downloader.modelExists(model.id),
+                    onDownload: { downloader.startDownload(model: model.id) },
+                    onLoad: {
+                        downloader.onComplete?(downloader.modelPath(model.id))
+                    }
+                )
+            }
+        }
+        .padding(.horizontal)
+        .padding(.bottom, 20)
+    }
+
+    private var downloadingView: some View {
+        VStack(spacing: 12) {
+            ProgressView(value: downloader.overallProgress)
+                .progressViewStyle(.linear)
+            HStack {
+                Text(downloader.statusMessage)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                Text("\(Int(downloader.overallProgress * 100))%")
+                    .font(.caption.monospacedDigit())
+                    .foregroundColor(.secondary)
+            }
+            if let err = downloader.errorMessage {
+                Text(err)
+                    .font(.caption)
+                    .foregroundColor(.red)
+            }
+        }
+        .padding(.horizontal)
+        .padding(.bottom, 20)
+    }
+}
+
+private struct ModelDownloadRow: View {
+    let model: DownloadableModel
+    let alreadyDownloaded: Bool
+    let onDownload: () -> Void
+    let onLoad: () -> Void
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(model.id).font(.body).fontWeight(.semibold)
+                    if alreadyDownloaded {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                            .font(.caption)
+                    }
+                }
+                Text("\(model.params) · \(model.hardware)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Text(byteFormatter.string(fromByteCount: model.modelBytes))
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            Button(alreadyDownloaded ? "Load" : "Download") {
+                alreadyDownloaded ? onLoad() : onDownload()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(alreadyDownloaded ? .green : .indigo)
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 12)
+        .background(Color.secondary.opacity(0.08))
+        .cornerRadius(8)
     }
 }
 
@@ -334,6 +512,87 @@ struct VolumeRow: View {
         .padding(.horizontal)
         .opacity(muted ? 0.55 : 1.0)
         .animation(.easeOut(duration: 0.15), value: muted)
+    }
+}
+
+// MARK: - Waveform visualiser
+
+struct WaveformView: View {
+    let waveform: WaveformBuffer
+    let isPlaying: Bool
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30)) { context in
+            Canvas { ctx, size in
+                // Capture context.date to establish an explicit dependency on
+                // the timeline tick. Without this, SwiftUI sees WaveformBuffer
+                // (a reference type) as unchanged between frames and caches the
+                // Canvas output — the waveform appears frozen even though the
+                // ring buffer is updating at 30+ fps on the audio thread.
+                _ = context.date
+
+                let (snapL, snapR) = waveform.snapshot()
+                let count = snapL.count
+                guard count > 1 else { return }
+
+                let w = size.width
+                let h = size.height
+                let midY = h * 0.5
+                let amp  = midY * 0.9   // max excursion from centre
+
+                // Background
+                ctx.fill(
+                    Path(CGRect(origin: .zero, size: size)),
+                    with: .color(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+                )
+
+                // Draw one channel as a filled polyline
+                func polyline(peaks: [Float], color: Color) {
+                    var path = Path()
+                    for i in 0 ..< count {
+                        let x = CGFloat(i) / CGFloat(count - 1) * w
+                        let y = midY - CGFloat(peaks[i]) * amp
+                        if i == 0 { path.move(to: CGPoint(x: x, y: y)) }
+                        else       { path.addLine(to: CGPoint(x: x, y: y)) }
+                    }
+                    // Mirror to fill the waveform shape
+                    for i in stride(from: count - 1, through: 0, by: -1) {
+                        let x = CGFloat(i) / CGFloat(count - 1) * w
+                        let y = midY + CGFloat(peaks[i]) * amp
+                        path.addLine(to: CGPoint(x: x, y: y))
+                    }
+                    path.closeSubpath()
+                    ctx.fill(path, with: .color(color.opacity(0.25)))
+                    // Outline
+                    var line = Path()
+                    for i in 0 ..< count {
+                        let x = CGFloat(i) / CGFloat(count - 1) * w
+                        let y = midY - CGFloat(peaks[i]) * amp
+                        if i == 0 { line.move(to: CGPoint(x: x, y: y)) }
+                        else       { line.addLine(to: CGPoint(x: x, y: y)) }
+                    }
+                    ctx.stroke(line, with: .color(color.opacity(0.8)), lineWidth: 1)
+                }
+
+                polyline(peaks: snapL, color: .blue)
+                polyline(peaks: snapR, color: .green)
+
+                // Centre line
+                var centre = Path()
+                centre.move(to: CGPoint(x: 0, y: midY))
+                centre.addLine(to: CGPoint(x: w, y: midY))
+                ctx.stroke(centre,
+                           with: .color(Color.secondary.opacity(0.2)),
+                           lineWidth: 0.5)
+            }
+            .cornerRadius(8)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
+            )
+            .opacity(isPlaying ? 1.0 : 0.35)
+            .animation(.easeOut(duration: 0.3), value: isPlaying)
+        }
     }
 }
 

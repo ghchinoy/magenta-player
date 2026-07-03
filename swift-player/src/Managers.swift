@@ -56,9 +56,51 @@ private final class EngineHandle: @unchecked Sendable {
 /// Written by the audio render thread, read by the metrics timer.
 /// Aligned 32-bit float stores on Apple Silicon are single-instruction,
 /// making this safe for metering (a stale frame is acceptable).
-private final class LevelTracker: @unchecked Sendable {
+final class LevelTracker: @unchecked Sendable {
     var left:  Float = 0
     var right: Float = 0
+}
+
+// MARK: - Waveform buffer
+
+/// Lock-free circular buffer of peak-amplitude pairs written by the audio
+/// render thread, read by the Canvas in WaveformView at 30 fps.
+///
+/// Each render callback pushes `samplesPerCallback` pairs (one peak per
+/// `chunkSize`-sample chunk). Natural Apple Silicon float-store atomicity
+/// is sufficient — a stale or torn waveform frame is visually imperceptible.
+final class WaveformBuffer: @unchecked Sendable {
+    static let capacity        = 512   // display columns of rolling history
+    static let samplesPerPush  = 8     // peaks pushed per render callback
+    // chunk = frameCount / samplesPerPush (≈64 samples @ 512-frame buffer)
+
+    // Written by audio thread, read by Canvas — no locking needed for display
+    private(set) var peaksL = [Float](repeating: 0, count: capacity)
+    private(set) var peaksR = [Float](repeating: 0, count: capacity)
+    // `head` is the NEXT write position (oldest visible sample is at head,
+    // newest is at head-1 mod capacity)
+    private(set) var head   = 0
+
+    /// Push one peak pair. Call from the audio render thread.
+    func push(l: Float, r: Float) {
+        peaksL[head] = l
+        peaksR[head] = r
+        head = (head + 1) % Self.capacity
+    }
+
+    /// Snapshot the buffer into two flat arrays ordered oldest→newest,
+    /// safe to call from any thread (minor tearing is acceptable for display).
+    func snapshot() -> (l: [Float], r: [Float]) {
+        let h = head
+        var l = [Float](repeating: 0, count: Self.capacity)
+        var r = [Float](repeating: 0, count: Self.capacity)
+        for i in 0 ..< Self.capacity {
+            let src = (h + i) % Self.capacity
+            l[i] = peaksL[src]
+            r[i] = peaksR[src]
+        }
+        return (l, r)
+    }
 }
 
 // MARK: - AudioEngineManager
@@ -93,6 +135,7 @@ class PlayerManager: ObservableObject {
     private let handle: EngineHandle?
     private let audioEngine  = AudioEngineManager()
     private let levels       = LevelTracker()
+    let waveform             = WaveformBuffer()   // read by WaveformView via @StateObject
     private var metricsTimer: DispatchSourceTimer?
 
     init() {
@@ -118,6 +161,7 @@ class PlayerManager: ObservableObject {
         // cycles and no @MainActor isolation issues on the audio thread.
         let engineRef = handle?.ref
         let levels    = self.levels
+        let waveform  = self.waveform
 
         let source = AVAudioSourceNode(format: format) { _, _, frameCount, outputData in
             let buffers = UnsafeMutableAudioBufferListPointer(outputData)
@@ -144,6 +188,22 @@ class PlayerManager: ObservableObject {
             }
             levels.left  = n > 0 ? sqrtf(sumL / Float(n)) : 0
             levels.right = n > 0 ? sqrtf(sumR / Float(n)) : 0
+
+            // Waveform buffer — push one peak per chunk of ~64 samples.
+            // samplesPerPush peaks per render call gives ~744 display samples/sec
+            // at 512-frame buffers; 512-slot capacity = ~0.7 s of rolling history.
+            let pushCount = WaveformBuffer.samplesPerPush
+            let chunkSize = max(1, n / pushCount)
+            for c in 0 ..< pushCount {
+                let start = c * chunkSize
+                let end   = min(start + chunkSize, n)
+                var pkL: Float = 0, pkR: Float = 0
+                for i in start ..< end {
+                    pkL = max(pkL, abs(pL[i]))
+                    pkR = max(pkR, abs(pR[i]))
+                }
+                waveform.push(l: pkL, r: pkR)
+            }
 
             return noErr
         }
@@ -180,6 +240,18 @@ class PlayerManager: ObservableObject {
             return
         }
 
+        // CRITICAL: stop the inference thread before reloading model weights.
+        // load_model() does NOT pause a running inference loop for you — if
+        // called while state.isPlaying, the inference thread (on its own OS
+        // thread) is actively reading model weight tensors via mlx::core ops
+        // at the exact moment load_model() reassigns them, producing a
+        // null-pointer SIGSEGV deep inside mlx::core::scheduler. Confirmed via
+        // three crash reports, all identical signature. See
+        // docs/mrt2-integration.md "Never Load a Model While Playing".
+        if state.isPlaying {
+            stop()
+        }
+
         let url          = URL(fileURLWithPath: path)
         let name         = url.lastPathComponent
         let resourcesDir = resolveResourcesDir(for: url)
@@ -209,6 +281,16 @@ class PlayerManager: ObservableObject {
                     self.state.metrics   = EngineMetrics(from: metrics)
                     self.isModelLoaded   = true
                     self.applyParameters()
+
+                    // load_model() auto-starts the inference thread on success
+                    // (realtime_runner.cpp:72 — undocumented in the header).
+                    // bypass_ defaults to false, so audio would flow
+                    // immediately while our own state.isPlaying stays false
+                    // (we never called play()) — sound plays, button still
+                    // says "Play". Stop explicitly so engine state matches UI
+                    // state; the user's next Play() does a full fresh start
+                    // with normal priming, as always.
+                    self.stop()
                 } else {
                     self.state.modelName = "Not Loaded"
                     self.isModelLoaded   = false

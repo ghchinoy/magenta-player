@@ -101,6 +101,7 @@ build-swift: build-mrt2
 	@cp "$(RELEASE_BINARY)" "$(APP_BINARY)"
 	@cp "$(INFO_PLIST)" "$(APP_BUNDLE)/Contents/Info.plist"
 	@cp "$(SELF_DIR)/Resources/about-logo.png" "$(APP_BUNDLE)/Contents/Resources/"
+	@cp "$(SELF_DIR)/Resources/AppIcon.icns"   "$(APP_BUNDLE)/Contents/Resources/"
 	@echo ""
 	@echo "Build complete:"
 	@echo "  binary : $(RELEASE_BINARY)"
@@ -123,6 +124,7 @@ run-swift: build-mrt2
 	@cp "$(SWIFT_BUILD_DIR)/debug/magenta-player" "$(APP_BINARY)"
 	@cp "$(INFO_PLIST)" "$(APP_BUNDLE)/Contents/Info.plist"
 	@cp "$(SELF_DIR)/Resources/about-logo.png" "$(APP_BUNDLE)/Contents/Resources/"
+	@cp "$(SELF_DIR)/Resources/AppIcon.icns"   "$(APP_BUNDLE)/Contents/Resources/"
 	@echo "Opening $(APP_BUNDLE) ..."
 	open "$(APP_BUNDLE)"
 
