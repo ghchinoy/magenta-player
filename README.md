@@ -2,7 +2,7 @@
 
 Welcome to the Magenta Players monorepo! This repository is designed to host multiple native and custom frontend players, control surfaces, and companion tools built on top of [Magenta RealTime 2 (MRT2)](https://magenta.withgoogle.com/mrt2), a state-of-the-art open-weights model for real-time local music generation.
 
-<img width="912" height="724" alt="Image" src="https://github.com/user-attachments/assets/ea09dba0-bdd2-4f02-86da-49b3ce0de4dd" />
+<img width="959" height="849" alt="Image" src="https://github.com/user-attachments/assets/ce5d32cd-9056-4e72-96db-af1a4c332c6a" />
 
 ## Monorepo Layout
 
