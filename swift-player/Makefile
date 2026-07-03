@@ -109,6 +109,15 @@ build-swift: build-mrt2
 	@echo ""
 	@echo "Launch with:  make run-swift"
 	@echo "           or open \"$(APP_BUNDLE)\""
+	@echo "           or install with: make install"
+
+# Copy the compiled .app bundle to /Applications/ so it is globally available
+# in Spotlight, Alfred, Finder, and Launchpad.
+install: build-swift
+	@echo "=== Installing Magenta Player to /Applications/ ==="
+	@rm -rf "/Applications/MagentaPlayer.app"
+	@cp -R "$(APP_BUNDLE)" "/Applications/"
+	@echo "Installation complete: /Applications/MagentaPlayer.app"
 
 # run-swift builds incrementally (swift build, not swift run) then opens the
 # .app bundle so macOS routes keyboard events to it properly.

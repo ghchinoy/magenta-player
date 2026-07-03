@@ -25,6 +25,7 @@
 
 .PHONY: help setup build-mrt2 build-swift run-swift build-rust all \
         mrt-init mrt-download \
+        install \
         clean clean-mrt2 clean-swift clean-rust
 
 # --------------------------------------------------------------------------- #
@@ -57,6 +58,7 @@ help:
 	@echo "Swift player:"
 	@echo "  build-swift        Release build → swift-player/.build/release/magenta-player"
 	@echo "  run-swift          Incremental build + launch"
+	@echo "  install            Compile and install to /Applications/MagentaPlayer.app"
 	@echo ""
 	@echo "Rust player:"
 	@echo "  build-rust         cargo build → rust-player/target/release/magenta-rust-player"
@@ -94,6 +96,9 @@ build-swift: build-mrt2
 
 run-swift:
 	$(MAKE) -C $(SWIFT_DIR) run-swift
+
+install: build-swift
+	$(MAKE) -C $(SWIFT_DIR) install
 
 # --------------------------------------------------------------------------- #
 # Rust player                                                                   #
