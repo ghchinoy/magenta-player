@@ -29,6 +29,10 @@ chrono = "0.4"
 # Animated terminal spinners for blocking/async loading phases
 indicatif = "0.17"
 
+# TUI dashboard for live metrics display
+ratatui = "0.29"
+crossterm = "0.28"
+
 # Audio level utilities and standard serialization/logging
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

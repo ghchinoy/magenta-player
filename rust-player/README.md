@@ -227,6 +227,25 @@ The FFI boundary and CPAL real-time stream integration is declared natively insi
 
 The C++ bridge in `src/bridge.h` compiles directly alongside the Rust crate. It routes stereo samples from C++ ring buffers into the **CPAL audio thread** using a completely lock-free, zero-mutex pipeline, ensuring that intensive MLX GPU tensor calculations never block the real-time audio output.
 
+### Live TUI Dashboard
+
+When running interactively (attached to a real terminal), `play` launches a live
+`ratatui` + `crossterm` full-screen dashboard instead of scrolling log lines:
+
+| Panel | Content |
+|---|---|
+| **Session info** | Model, prompt, params (temperature/top-k/CFGs), audio format, uptime, reset count |
+| **Frame budget gauge** | Transformer latency vs 40ms real-time budget, traffic-light coloured (green < 30ms / yellow < 40ms / red over-budget) |
+| **Sparkline** | Rolling 60-sample history of transformer latency (ms) |
+| **Controls bar** | Keyboard shortcuts |
+
+**Keyboard controls (interactive only):**
+- `q` / `ESC` — quit
+- `Ctrl-C` — quit
+- `r` — trigger context reset mid-playback (re-anchors generation to the current prompt without stopping inference)
+
+Falls back to the plain scrolling metrics log when stdout is not a TTY (piped output, CI, log files, `--record` mode) — the TUI never corrupts non-terminal output streams.
+
 ### Loading Indicators
 
 The three blocking/async startup phases (MusicCoCa asset init, model load, prompt encoding)

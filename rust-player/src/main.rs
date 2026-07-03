@@ -1,8 +1,22 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Gauge, Paragraph, Sparkline, Wrap},
+    Terminal,
+};
 
 // Bidirectional safe FFI bridge using cxx
 #[cxx::bridge]
@@ -582,7 +596,8 @@ fn run_player(config: AppConfig, args: PlayArgs) {
             default_config
         });
         
-    println!("Audio Format:  {} channels, {} Hz", config_format.channels(), config_format.sample_rate().0);
+    let audio_format_line = format!("{} channels, {} Hz", config_format.channels(), config_format.sample_rate().0);
+    println!("Audio Format:  {}", audio_format_line);
 
     // We pull stereo float samples from the runner and interleave them into the cpal output stream
     let runner_clone = Arc::clone(&runner);
@@ -678,22 +693,214 @@ fn run_player(config: AppConfig, args: PlayArgs) {
         return;
     }
 
-    println!("\n[INFO] Playback running. Press Ctrl+C to stop.");
-    
-    // Poll and print live metrics from the engine every 2 seconds
-    let mut count = 0;
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        let metrics_json = runner.read_metrics();
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&metrics_json) {
-            let trans_ms = val.get("transformer_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let dropped = val.get("dropped_frames").and_then(|v| v.as_u64()).unwrap_or(0);
-            println!("[Metrics] tick: {:03} | transformer: {:.2} ms | dropped frames: {}", 
-                count, 
-                trans_ms,
-                dropped
-            );
+    // Use TUI dashboard when stdout is an interactive terminal.
+    // Fall back to the plain scrolling metrics log otherwise (piped output,
+    // CI, log files) so we never corrupt non-terminal output streams.
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        run_tui_dashboard(&runner, &prompt, &model_path, temperature, topk, cfg_text, cfg_drums, audio_format_line);
+    } else {
+        println!("\n[INFO] Playback running. Press Ctrl+C to stop.");
+        let mut count = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let metrics_json = runner.read_metrics();
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&metrics_json) {
+                let trans_ms = val.get("transformer_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let dropped = val.get("dropped_frames").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("[Metrics] tick: {:03} | transformer: {:.2} ms | dropped frames: {}",
+                    count, trans_ms, dropped);
+            }
+            count += 1;
         }
-        count += 1;
     }
+}
+
+fn run_tui_dashboard(
+    runner: &Arc<cxx::UniquePtr<ffi::RealtimeRunnerBridge>>,
+    prompt: &str,
+    model_path: &Option<String>,
+    temperature: f32,
+    topk: u32,
+    cfg_text: f32,
+    cfg_drums: f32,
+    audio_format: String,
+) {
+    // Set up terminal
+    enable_raw_mode().expect("❌ Failed to enable raw mode");
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen).expect("❌ Failed to enter alternate screen");
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).expect("❌ Failed to create terminal");
+
+    // History ring for sparkline (30 datapoints ~ 1s at 33 Hz draw rate)
+    const HIST: usize = 60;
+    let mut trans_history: VecDeque<u64> = VecDeque::with_capacity(HIST);
+    let session_start = std::time::Instant::now();
+
+    let mut last_trans_ms = 0.0f64;
+    let mut last_dropped: u64 = 0;
+    let mut resets: u32 = 0;
+
+    let model_display = model_path
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_stem())
+        .and_then(|s| s.to_str())
+        .unwrap_or("none")
+        .to_string();
+
+    let draw_tick = std::time::Duration::from_millis(33); // ~30 Hz
+    let metrics_tick = std::time::Duration::from_millis(200); // 5 Hz
+    let mut last_metrics = std::time::Instant::now();
+
+    let result = (|| -> std::io::Result<()> {
+        loop {
+            // Poll crossterm events (non-blocking)
+            if event::poll(draw_tick)? {
+                if let Event::Key(key) = event::read()? {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                        KeyCode::Char('r') => {
+                            runner.toggle_play(true);
+                            runner.reset_dropped_frames();
+                            resets += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Refresh metrics at 5 Hz (not every draw tick -- read_metrics is a JSON alloc)
+            if last_metrics.elapsed() >= metrics_tick {
+                last_metrics = std::time::Instant::now();
+                let metrics_json = runner.read_metrics();
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&metrics_json) {
+                    last_trans_ms = val.get("transformer_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    last_dropped = val.get("dropped_frames").and_then(|v| v.as_u64()).unwrap_or(0);
+                }
+                let sparkval = last_trans_ms.round() as u64;
+                trans_history.push_back(sparkval);
+                if trans_history.len() > HIST {
+                    trans_history.pop_front();
+                }
+            }
+
+            // Draw frame
+            let uptime = session_start.elapsed().as_secs();
+            let trans_ms = last_trans_ms;
+            let dropped = last_dropped;
+            let spark_data: Vec<u64> = trans_history.iter().copied().collect();
+            let resets_count = resets;
+            let prompt_ref = prompt;
+            let model_ref = model_display.as_str();
+            let audio_ref = audio_format.as_str();
+
+            // Traffic-light color for transformer latency vs 40ms budget
+            let latency_color = if trans_ms < 30.0 {
+                Color::Green
+            } else if trans_ms < 40.0 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+
+            // Gauge ratio: how much of the 40ms budget we're using (capped at 100%)
+            let budget_ratio = (trans_ms / 40.0).clamp(0.0, 1.0);
+
+            terminal.draw(|f| {
+                let area = f.area();
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(6),  // session info
+                        Constraint::Length(4),  // budget gauge
+                        Constraint::Length(8),  // sparkline
+                        Constraint::Min(0),     // spacer
+                        Constraint::Length(3),  // key help
+                    ])
+                    .split(area);
+
+                // ── Session info panel ──────────────────────────────────────
+                let info_lines = vec![
+                    Line::from(vec![
+                        Span::styled("  Model    ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(model_ref),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Prompt   ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(format!("\"{}\"", prompt_ref)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Params   ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(format!("temp {:.1}  top-k {}  cfg-text {:.1}  cfg-drums {:.1}",
+                            temperature, topk, cfg_text, cfg_drums)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Audio    ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(audio_ref),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Uptime   ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(format!("{:02}:{:02}:{:02}  resets: {}",
+                            uptime / 3600, (uptime % 3600) / 60, uptime % 60, resets_count)),
+                    ]),
+                ];
+                let info = Paragraph::new(info_lines)
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Magenta RealTime 2 — Rust Player ")
+                        .title_style(Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)))
+                    .wrap(Wrap { trim: false });
+                f.render_widget(info, rows[0]);
+
+                // ── Budget gauge ────────────────────────────────────────────
+                let gauge_label = format!(
+                    "Transformer  {:.1} ms  /  40.0 ms budget  ({:.0}%)   dropped frames: {}",
+                    trans_ms, budget_ratio * 100.0, dropped
+                );
+                let gauge = Gauge::default()
+                    .block(Block::default().borders(Borders::ALL).title(" Frame Budget "))
+                    .gauge_style(Style::default().fg(latency_color))
+                    .ratio(budget_ratio)
+                    .label(gauge_label);
+                f.render_widget(gauge, rows[1]);
+
+                // ── Sparkline ───────────────────────────────────────────────
+                let spark = Sparkline::default()
+                    .block(Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Transformer ms (last 60 samples) "))
+                    .style(Style::default().fg(latency_color))
+                    .data(&spark_data);
+                f.render_widget(spark, rows[2]);
+
+                // ── Key help bar ────────────────────────────────────────────
+                let help = Paragraph::new(Line::from(vec![
+                    Span::styled("  q / ESC ", Style::default().fg(Color::Yellow)),
+                    Span::raw("quit    "),
+                    Span::styled("  r ", Style::default().fg(Color::Yellow)),
+                    Span::raw("reset audio context (re-anchors to prompt)    "),
+                    Span::styled("  Ctrl-C ", Style::default().fg(Color::Yellow)),
+                    Span::raw("quit"),
+                ]))
+                .block(Block::default().borders(Borders::ALL).title(" Controls "));
+                f.render_widget(help, rows[4]);
+            })?;
+        }
+        Ok(())
+    })();
+
+    // Always restore the terminal, even on panic/error
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+
+    if let Err(e) = result {
+        eprintln!("TUI error: {}", e);
+    }
+
+    println!("Playback stopped.");
 }
