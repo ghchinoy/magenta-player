@@ -599,6 +599,19 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     let audio_format_line = format!("{} channels, {} Hz", config_format.channels(), config_format.sample_rate().0);
     println!("Audio Format:  {}", audio_format_line);
 
+    // Audio Resampler Setup:
+    // MRT2 generates frames strictly at 48000 Hz. If the hardware device runs at a
+    // different rate (e.g. 44100 Hz on Sonos Roam or Bluetooth), we perform real-time
+    // lock-free linear resampling to prevent flat pitch shifts and playback speed drops.
+    let device_sample_rate = config_format.sample_rate().0 as f64;
+    let ratio = 48000.0 / device_sample_rate;
+    let is_resampling = (device_sample_rate - 48000.0).abs() > 5.0; // allow small tolerance
+
+    // Resampler boundary states captured mutably by the audio thread closure
+    let mut src_accum = 0.0f64;
+    let mut last_sample_l = 0.0f32;
+    let mut last_sample_r = 0.0f32;
+
     // We pull stereo float samples from the runner and interleave them into the cpal output stream
     let runner_clone = Arc::clone(&runner);
     let stream = device
@@ -606,16 +619,61 @@ fn run_player(config: AppConfig, args: PlayArgs) {
             &config_format.into(),
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let num_frames = data.len() / 2;
-                let mut left = vec![0.0f32; num_frames];
-                let mut right = vec![0.0f32; num_frames];
                 
-                // Pull Left/Right stereo samples from the C++ ring buffer (lock-free)
-                runner_clone.read_audio_stereo(&mut left, &mut right);
-                
-                // Interleave them into the cpal hardware buffer
-                for (i, frame) in data.chunks_exact_mut(2).enumerate() {
-                    frame[0] = left[i];
-                    frame[1] = right[i];
+                if !is_resampling {
+                    // Fast native path (no resampling overhead)
+                    let mut left = vec![0.0f32; num_frames];
+                    let mut right = vec![0.0f32; num_frames];
+                    runner_clone.read_audio_stereo(&mut left, &mut right);
+                    for (i, frame) in data.chunks_exact_mut(2).enumerate() {
+                        frame[0] = left[i];
+                        frame[1] = right[i];
+                    }
+                } else {
+                    // High-fidelity, lock-free real-time linear resampler.
+                    // Boundary-safe: keeps memory of the very last sample of the prior
+                    // block to interpolate cleanly across buffer boundaries, preventing
+                    // clicks and pops.
+                    let next_src_pos = src_accum + num_frames as f64 * ratio;
+                    let consumed_inputs = next_src_pos.floor() as usize;
+                    
+                    let mut left = vec![0.0f32; consumed_inputs];
+                    let mut right = vec![0.0f32; consumed_inputs];
+                    
+                    if consumed_inputs > 0 {
+                        runner_clone.read_audio_stereo(&mut left, &mut right);
+                    }
+                    
+                    // Input buffers of size consumed_inputs + 1 to hold the saved last sample at index 0
+                    let mut input_l = vec![0.0f32; consumed_inputs + 1];
+                    let mut input_r = vec![0.0f32; consumed_inputs + 1];
+                    
+                    input_l[0] = last_sample_l;
+                    input_r[0] = last_sample_r;
+                    
+                    if consumed_inputs > 0 {
+                        input_l[1..=consumed_inputs].copy_from_slice(&left);
+                        input_r[1..=consumed_inputs].copy_from_slice(&right);
+                        
+                        last_sample_l = left[consumed_inputs - 1];
+                        last_sample_r = right[consumed_inputs - 1];
+                    }
+                    
+                    // Resample and interleave directly into the hardware output buffer
+                    for i in 0..num_frames {
+                        let src_pos = src_accum + i as f64 * ratio;
+                        let idx = src_pos.floor() as usize;
+                        let frac = (src_pos - idx as f64) as f32;
+                        
+                        let out_l = input_l[idx] * (1.0 - frac) + input_l[idx + 1] * frac;
+                        let out_r = input_r[idx] * (1.0 - frac) + input_r[idx + 1] * frac;
+                        
+                        data[i * 2] = out_l;
+                        data[i * 2 + 1] = out_r;
+                    }
+                    
+                    // Store fractional accumulator offset for the next callback block
+                    src_accum = next_src_pos - consumed_inputs as f64;
                 }
             },
             |err| eprintln!("❌ Audio stream error: {}", err),

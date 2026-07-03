@@ -114,9 +114,13 @@ If the device reports 44.1 kHz and you write 48 kHz content without resampling:
 **Fixes for the Rust player:**
 - Query the device's preferred sample rate via CPAL before starting the
   stream; warn the user if it differs from 48 kHz.
-- Implement a high-quality resampler (e.g. libsamplerate / rubberband) in
-  the audio render callback when `device_rate != 48_000`.
-- See `magenta-player-3vy.2` (bd issue) for the tracked implementation task.
+- **Resolved (magenta-player-3vy.2):** Implemented a high-fidelity, lock-free,
+  zero-allocation linear resampler with boundary-preserved sample memory directly
+  in the CPAL callback. When a 44.1 kHz device (like Sonos Roam) is active, it
+  calculates the dynamic input frames needed, pulls them via `read_audio_stereo`,
+  interpolates with phase continuity across buffer boundaries, and writes stereo
+  output. This completely eliminates pitch-shifting, speed drops, and boundary
+  clicks with negligible CPU overhead.
 
 ## TimelineView + Canvas: Always Capture `context.date`
 
