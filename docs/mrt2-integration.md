@@ -365,6 +365,28 @@ auto peaks = runner->get_waveform_peaks(200);       // 200-bucket reduction
 Use `get_waveform_peaks` to draw a visual thumbnail of a saved seed without
 decoding the full WAV — fast enough to call in a list view at scroll time.
 
+## Real-Time Audio Visualizations (Oscilloscope)
+
+For drawing real-time interactive PCM waveforms (oscilloscopes) inside a player
+UI (e.g. TUI or SwiftUI), pulling the PCM stream concurrently from the audio
+render thread is the standard design.
+
+### Guidelines:
+1. **Never block the Audio Thread**: The audio render callback (CPAL in Rust,
+   AVAudioSourceNode in Swift) is a high-priority, real-time context. Taking a
+   blocking `Mutex` or allocating memory will cause buffer underruns (glitches).
+2. **Lock-Free SPSC Tapping**: Copy the pulled mono-summed float samples (`(L + R) * 0.5`)
+   into a lock-free Single-Producer Single-Consumer (SPSC) ring buffer (the `ringbuf` or
+   `rtrb` crate in Rust, or a lock-free atomic ring in Swift).
+   - The audio thread is the **Producer** (non-blocking pushes).
+   - The TUI/UI drawing thread is the **Consumer** (reading at ~30 Hz).
+3. **Peak-Normalization**: Compute the peak absolute amplitude of your trace window
+   and multiply by a scale factor (`scale = 0.95 / peak`) before drawing. This
+   ensures the trace is always highly visible and responsive, regardless of output volume.
+4. **Drawing lines**: Use ratatui's `Canvas` widget with Braille markers, drawing
+   connected line segments (`Line` or `CanvasLine`) between consecutive samples on
+   `y_bounds [-1.0, 1.0]` for an extremely crisp, glowing trace.
+
 ## Resources Path from `mrt models init` vs App Bundle
 
 In a future `.app` bundle deployment, the SpectroStream and MusicCoCa TFLite
