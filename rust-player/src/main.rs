@@ -43,6 +43,7 @@ mod ffi {
             dest_l: &mut [f32],
             dest_r: &mut [f32],
         ) -> bool;
+        fn reset_dropped_frames(self: &RealtimeRunnerBridge);
     }
 }
 
@@ -371,10 +372,61 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+/// Creates a consistently-styled animated spinner for blocking/async loading
+/// phases (MusicCoCa asset init, model load, prompt encoding). Uses
+/// enable_steady_tick, which spawns its own background redraw thread -- this
+/// animates correctly even while the calling thread is blocked in a
+/// synchronous FFI call (e.g. load_model compiling the MLX graph).
+fn new_spinner(msg: impl Into<String>) -> indicatif::ProgressBar {
+    let pb = indicatif::ProgressBar::new_spinner();
+    pb.set_style(
+        indicatif::ProgressStyle::default_spinner()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    pb.set_message(msg.into());
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb
+}
+
+/// Per mrt2-integration.md: the `resources/` directory (MusicCoCa +
+/// SpectroStream assets) is a sibling of the model file somewhere up the
+/// tree, not nested inside it, and at an unspecified depth (varies by how
+/// the user organized their model downloads) -- so we walk up from the
+/// model's parent directory looking for a `resources/` dir rather than
+/// hardcoding a level count.
+fn find_resources_near_model(model_path: &str) -> Option<String> {
+    let mut dir = std::path::Path::new(model_path).parent()?.to_path_buf();
+    loop {
+        let candidate = dir.join("resources");
+        if candidate.is_dir() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 fn run_player(config: AppConfig, args: PlayArgs) {
     // Merge logic: CLI arguments override XDG config file defaults
     let model_path = args.model.map(|p| p.to_string_lossy().to_string()).or(config.model);
-    let resources_path = expand_tilde(&args.resources.unwrap_or(config.resources));
+    let mut resources_path = expand_tilde(&args.resources.unwrap_or(config.resources));
+    // If the configured/default resources path doesn't actually exist, try to
+    // auto-derive it from the model's location before giving up -- helps
+    // anyone whose models live somewhere other than the standard
+    // magenta-rt-v2/ layout without requiring them to configure --resources
+    // by hand. Only used as a fallback: an explicitly-set path that exists
+    // always wins.
+    if !std::path::Path::new(&resources_path).is_dir() {
+        if let Some(ref model) = model_path {
+            if let Some(found) = find_resources_near_model(&expand_tilde(model)) {
+                println!("[INFO] Configured resources path not found ({}); auto-derived from model location: {}", resources_path, found);
+                resources_path = found;
+            }
+        }
+    }
     let prompt = args.prompt.unwrap_or(config.prompt);
     let temperature = args.temperature.unwrap_or(config.temperature);
     let topk = args.topk.unwrap_or(config.topk);
@@ -416,7 +468,15 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     //    the engine silently fails to encode prompts and stays on its
     //    hardcoded default (piano) tokens forever.
     println!("Loading MusicCoCa assets from: {}", resources_path);
-    if runner_unique.pin_mut().init_assets(&resources_path) {
+    let assets_spinner = new_spinner("Loading...");
+    let assets_ok = runner_unique.pin_mut().init_assets(&resources_path);
+    // finish_and_clear() (not finish_with_message()) because indicatif silently
+    // suppresses ALL drawing -- including the finish message -- when stderr
+    // isn't a TTY (piped output, log files, CI). We always want this status
+    // line visible, so we print it ourselves after clearing the spinner:
+    // animated spinner only when interactive, guaranteed status everywhere.
+    assets_spinner.finish_and_clear();
+    if assets_ok {
         println!("✓ MusicCoCa assets (tokenizer/text-encoder/quantizer) loaded!");
     } else {
         eprintln!("❌ Error: Failed to load MusicCoCa assets from {}", resources_path);
@@ -448,8 +508,14 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     // 4. Load the model if provided:
     if let Some(ref path_str) = model_path {
         let expanded_path = expand_tilde(path_str);
-        println!("Loading model from: {}", expanded_path);
-        if runner_unique.pin_mut().load_model(&expanded_path) {
+        // load_model compiles the MLX computation graph and can take 5-15s on
+        // first load -- the spinner's steady tick keeps animating throughout
+        // even though this call blocks the current thread.
+        println!("Loading model from: {} (this can take 5-15s on first load)", expanded_path);
+        let model_spinner = new_spinner("Compiling MLX graph...");
+        let load_ok = runner_unique.pin_mut().load_model(&expanded_path);
+        model_spinner.finish_and_clear();
+        if load_ok {
             println!("✓ Model loaded successfully!");
         } else {
             eprintln!("❌ Error: Failed to load model from {}", expanded_path);
@@ -463,29 +529,27 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     //     mapper -> quantize) to finish before unmuting audio, so we never play
     //     back the engine's hardcoded default (piano) tokens.
     //     Status codes: 0=idle, 1=fetching, 2=success, 3=error.
-    use std::io::Write;
-    print!("Encoding style prompt");
-    std::io::stdout().flush().ok();
+    println!("Encoding style prompt...");
+    let encode_spinner = new_spinner("Waiting for encoder...");
     let encode_timeout = std::time::Duration::from_secs(5);
     let encode_start = std::time::Instant::now();
     loop {
         let status = runner_unique.get_quantizer_status();
         if status == 2 {
-            println!(" done!");
+            encode_spinner.finish_and_clear();
+            println!("✓ Style prompt encoded!");
             break;
         }
         if status == 3 {
-            println!();
+            encode_spinner.finish_and_clear();
             eprintln!("[WARNING] Prompt encoding failed (status=3). Check that --resources points at a valid magenta-rt-v2/resources directory.");
             break;
         }
         if encode_start.elapsed() > encode_timeout {
-            println!();
+            encode_spinner.finish_and_clear();
             eprintln!("[WARNING] Timed out waiting for prompt encoding after {:?}; starting anyway.", encode_timeout);
             break;
         }
-        print!(".");
-        std::io::stdout().flush().ok();
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
 
@@ -551,6 +615,12 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     // 7. Start the C++ real-time inference thread
     println!("Starting real-time playback pipeline...");
     runner.toggle_play(true);
+
+    // dropped_frames is cumulative since engine construction; zero it here so
+    // the metrics loop / final recording report only reflect underruns from
+    // this session's actual playback, not any pre-existing accumulation from
+    // model load or the CPAL device opening before this explicit reset.
+    runner.reset_dropped_frames();
 
     // 8. If --record was requested, capture a fixed-length clip and exit.
     // Note: this pulls from the engine's internal recording buffer, which is

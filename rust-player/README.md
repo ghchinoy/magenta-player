@@ -23,7 +23,7 @@ temperature = 1.3
 topk = 40
 midi_gate = false
 cfg_text = 3.0     # CFG weight for the style prompt (higher = more adherent, less natural)
-cfg_notes = 5.0    # CFG weight for MIDI note conditioning
+cfg_notes = 5.0    # CFG weight for MIDI note conditioning -- see note below, currently a no-op
 cfg_drums = 1.0    # CFG weight for drum conditioning (try 0.0 with drumless=false for softer drums)
 drumless = false   # Suppress drums entirely, independent of the style prompt
 volume_db = 0.0    # Output gain in dB (0.0 = unity gain)
@@ -40,6 +40,19 @@ output_dir = "~/Documents/Magenta/magenta-rt-v2/recordings"  # Default folder fo
 > from the model weights. If this path is wrong, the player will print a warning on
 > startup and silently fall back to the model's default style prompt (a piano loop) no
 > matter what `--prompt` you pass. See `docs/realtime-audio.md` for details.
+>
+> **Auto-fallback:** if the configured `resources` path doesn't exist on disk, the player
+> automatically walks up from your `--model`/`config.model` file's directory looking for a
+> sibling `resources/` folder before giving up (prints `[INFO] ... auto-derived from model
+> location: ...` when this happens). An explicitly-configured path that exists always wins.
+>
+> **`--cfg-notes` / `cfg_notes` is currently a no-op.** This CLI has no MIDI input wired up
+> (unlike the Swift player's CoreMIDI integration), so the "notes held" conditioning signal
+> is always empty. The engine's classifier-free guidance compares a positive vs. negative
+> conditioning pass to compute the CFG contrast term — with no notes ever held, those two
+> passes are identical for the notes signal, so the contrast is exactly zero and `cfg_notes`
+> has no audible effect at any value. Kept in the CLI for API completeness / future MIDI
+> support, not because changing it currently does anything.
 
 ---
 
@@ -213,6 +226,15 @@ make run
 The FFI boundary and CPAL real-time stream integration is declared natively inside `src/main.rs`.
 
 The C++ bridge in `src/bridge.h` compiles directly alongside the Rust crate. It routes stereo samples from C++ ring buffers into the **CPAL audio thread** using a completely lock-free, zero-mutex pipeline, ensuring that intensive MLX GPU tensor calculations never block the real-time audio output.
+
+### Loading Indicators
+
+The three blocking/async startup phases (MusicCoCa asset init, model load, prompt encoding)
+show an animated `indicatif` spinner in an interactive terminal. Each phase always prints a
+plain status line first/after (`Loading model from: ...` / `✓ Model loaded successfully!`)
+regardless of TTY state — indicatif suppresses spinner drawing entirely when stderr isn't a
+terminal (piped output, log files, CI), so the spinner is purely cosmetic; the actual status
+information is never spinner-only.
 
 ---
 

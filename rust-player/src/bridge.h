@@ -139,6 +139,14 @@ public:
         return runner_->get_recorded_audio(dest_l.data(), dest_r.data(), start_idx, dest_l.size());
     }
 
+    /// dropped_frames is cumulative since RealtimeRunner construction. Call
+    /// this right before unmuting audio so the metrics loop reports
+    /// per-session underruns rather than including the handful of
+    /// startup-priming drops that are expected and not a real problem.
+    void reset_dropped_frames() const {
+        const_cast<magentart::core::RealtimeRunner*>(runner_.get())->reset_dropped_frames();
+    }
+
 private:
     std::unique_ptr<magentart::core::RealtimeRunner> runner_;
 };
