@@ -156,6 +156,7 @@ struct PlayerView: View {
         // Start AVAudioEngine on first appearance — must happen before playback
         .onAppear {
             playerManager.setupAudioEngine()
+            playerManager.restoreLastModel()
         }
         // Wire up error reporting
         .errorAlert($playerManager.error)

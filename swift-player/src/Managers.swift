@@ -291,13 +291,24 @@ class PlayerManager: ObservableObject {
                     // state; the user's next Play() does a full fresh start
                     // with normal priming, as always.
                     self.stop()
+
+                    // Persist path for auto-restore on next launch
+                    UserDefaults.standard.set(path, forKey: "LastLoadedModelPath")
                 } else {
                     self.state.modelName = "Not Loaded"
                     self.isModelLoaded   = false
                     self.error = PlayerError.modelLoadFailed(path: path)
+                    UserDefaults.standard.removeObject(forKey: "LastLoadedModelPath")
                 }
             }
         }
+    }
+
+    /// Restore the last-loaded model path if it exists and is still valid on disk.
+    func restoreLastModel() {
+        guard let path = UserDefaults.standard.string(forKey: "LastLoadedModelPath"),
+              FileManager.default.fileExists(atPath: path) else { return }
+        loadModel(at: path)
     }
 
     // MARK: - Playback control
