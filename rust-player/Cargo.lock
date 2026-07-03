@@ -921,6 +921,7 @@ dependencies = [
  "env_logger",
  "hound",
  "indicatif",
+ "libc",
  "log",
  "ratatui",
  "serde",

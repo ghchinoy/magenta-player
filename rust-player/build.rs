@@ -16,8 +16,7 @@ fn discover_libs(dir: &Path, search_paths: &mut HashSet<PathBuf>, libs: &mut Vec
                         }
                         if let Some(file_stem) = path.file_stem() {
                             let stem = file_stem.to_string_lossy();
-                            if stem.starts_with("lib") {
-                                let lib_name = &stem[3..];
+                            if let Some(lib_name) = stem.strip_prefix("lib") {
                                 // We will link magentart_core manually first, so skip it here
                                 if lib_name != "magentart_core" && !libs.contains(&lib_name.to_string()) {
                                     libs.push(lib_name.to_string());
@@ -63,7 +62,7 @@ fn main() {
     }
 
     // Build the C++ bridge using cxx-build
-    cxx_build::bridge("src/main.rs")
+    cxx_build::bridge("src/ffi.rs")
         .include(&include_dir)
         .flag_if_supported("-std=c++17")
         .compile("magenta_rust_bridge");
@@ -106,6 +105,6 @@ fn main() {
 
     // Rebuild if our source files or this build script change
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/main.rs");
+    println!("cargo:rerun-if-changed=src/ffi.rs");
     println!("cargo:rerun-if-changed=src/bridge.h");
 }

@@ -1,389 +1,43 @@
-use clap::{Args as ClapArgs, Parser, Subcommand};
-use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
-use std::path::PathBuf;
+//! Magenta RealTime 2 — native Rust CLI player.
+//!
+//! Module layout:
+//! - `ffi`    — the cxx bridge to the C++ `magentart::core::RealtimeRunner`
+//! - `config` — XDG `config.toml` (AppConfig, load/save) + path helpers
+//! - `cli`    — clap arg structs + the `config` subcommand handler
+//! - `audio`  — CPAL output stream (+ real-time resampler) and `--record` WAV
+//! - `tui`    — the interactive ratatui dashboard
+//!
+//! `main` just wires argument parsing to the play/config paths, and `run_player`
+//! orchestrates the startup sequence (assets -> params -> model -> stream -> play).
+
+mod audio;
+mod cli;
+mod config;
+mod ffi;
+mod tui;
+
+use crate::cli::{Cli, Commands, PlayArgs};
+use crate::config::{expand_tilde, find_resources_near_model, load_config, AppConfig};
+use crate::ffi::ffi::create_runner;
+use clap::Parser;
 use std::sync::Arc;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, Paragraph, Sparkline, Wrap},
-    Terminal,
-};
-
-// Bidirectional safe FFI bridge using cxx
-#[cxx::bridge]
-mod ffi {
-    unsafe extern "C++" {
-        include!("magenta-rust-player/src/bridge.h");
-
-        // We can expose the C++ RealtimeRunner class directly to Rust
-        type RealtimeRunnerBridge;
-
-        fn create_runner() -> UniquePtr<RealtimeRunnerBridge>;
-        fn init_assets(self: Pin<&mut RealtimeRunnerBridge>, resource_dir: &str) -> bool;
-        fn load_model(self: Pin<&mut RealtimeRunnerBridge>, path: &str) -> bool;
-        fn set_prompt(self: &RealtimeRunnerBridge, prompt: &str);
-        fn set_temperature(self: &RealtimeRunnerBridge, temp: f32);
-        fn set_top_k(self: &RealtimeRunnerBridge, k: u32);
-        fn set_midi_gate(self: &RealtimeRunnerBridge, enabled: bool);
-        fn set_buffer_size(self: &RealtimeRunnerBridge, cap: usize);
-        fn set_cfg_text(self: &RealtimeRunnerBridge, v: f32);
-        fn set_cfg_notes(self: &RealtimeRunnerBridge, v: f32);
-        fn set_cfg_drums(self: &RealtimeRunnerBridge, v: f32);
-        fn set_drumless(self: &RealtimeRunnerBridge, on: bool);
-        fn set_volume_db(self: &RealtimeRunnerBridge, v: f32);
-        fn toggle_play(self: &RealtimeRunnerBridge, playing: bool);
-        fn get_quantizer_status(self: &RealtimeRunnerBridge) -> i32;
-        fn read_audio_stereo(
-            self: &RealtimeRunnerBridge,
-            dest_l: &mut [f32],
-            dest_r: &mut [f32],
-        ) -> bool;
-        fn read_metrics(self: &RealtimeRunnerBridge) -> String;
-        fn start_recording(self: &RealtimeRunnerBridge);
-        fn stop_recording(self: &RealtimeRunnerBridge);
-        fn get_recorded_sample_count(self: &RealtimeRunnerBridge) -> usize;
-        fn get_recorded_audio(
-            self: &RealtimeRunnerBridge,
-            start_idx: usize,
-            dest_l: &mut [f32],
-            dest_r: &mut [f32],
-        ) -> bool;
-        fn reset_dropped_frames(self: &RealtimeRunnerBridge);
-    }
-}
-
-// Implement Send and Sync so we can share the runner with the cpal audio callback thread safely.
-unsafe impl Send for ffi::RealtimeRunnerBridge {}
-unsafe impl Sync for ffi::RealtimeRunnerBridge {}
-
-/// Configuration Structure for XDG Config Support
-///
-/// `#[serde(default)]` at the struct level means any field missing from an
-/// older config.toml (e.g. after we add a new field in a later version) is
-/// filled in from `AppConfig::default()` below, rather than failing to parse
-/// -- which would otherwise silently fall through to load_config()'s
-/// from-scratch AppConfig::default() + save_config(), wiping out the user's
-/// existing saved model path, prompt, etc. Always add new fields with this
-/// safety in mind.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(default)]
-struct AppConfig {
-    model: Option<String>,
-    resources: String,
-    prompt: String,
-    temperature: f32,
-    topk: u32,
-    midi_gate: bool,
-    /// CFG weight for the text/style prompt (MusicCoCa). Higher = more adherent to the prompt.
-    cfg_text: f32,
-    /// CFG weight for MIDI note conditioning.
-    cfg_notes: f32,
-    /// CFG weight for drum conditioning.
-    cfg_drums: f32,
-    /// Suppress drums entirely, independent of the style prompt.
-    drumless: bool,
-    /// Output gain in dB (0.0 = unity gain / no change).
-    volume_db: f32,
-    /// Default directory for --record output WAV files.
-    output_dir: String,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            model: None,
-            resources: "~/Documents/Magenta/magenta-rt-v2/resources".to_string(),
-            prompt: "ambient lofi chords with acoustic guitar".to_string(),
-            temperature: 1.3,
-            topk: 40,
-            midi_gate: false,
-            // Match the C++ engine's own factory defaults (mlx_engine.cpp).
-            cfg_text: 3.0,
-            cfg_notes: 5.0,
-            cfg_drums: 1.0,
-            drumless: false,
-            volume_db: 0.0,
-            output_dir: "~/Documents/Magenta/magenta-rt-v2/recordings".to_string(),
-        }
-    }
-}
-
-fn get_config_path() -> PathBuf {
-    let mut path = dirs::config_dir().expect("❌ Error: Failed to find config directory");
-    path.push("magenta-rust-player");
-    std::fs::create_dir_all(&path).ok();
-    path.push("config.toml");
-    path
-}
-
-fn load_config() -> AppConfig {
-    let path = get_config_path();
-    if path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(config) = toml::from_str::<AppConfig>(&content) {
-                // Self-heal: if this file predates a field we've since added,
-                // #[serde(default)] silently filled it in above -- persist that
-                // now so `config list`/the file on disk always reflects the
-                // full, effective configuration rather than only what the user
-                // has explicitly touched via `config set`.
-                save_config(&config);
-                return config;
-            }
-        }
-    }
-    // Create and write default config if it doesn't exist
-    let default_config = AppConfig::default();
-    save_config(&default_config);
-    default_config
-}
-
-fn save_config(config: &AppConfig) {
-    let path = get_config_path();
-    if let Ok(content) = toml::to_string_pretty(config) {
-        std::fs::write(&path, content).ok();
-    }
-}
-
-#[derive(Parser, Debug)]
-#[command(name = "magenta-rust-player", author, version, about = "Rust CLI Player for Magenta RealTime 2", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Start real-time audio playback (CLI overrides local XDG config defaults)
-    Play(PlayArgs),
-    
-    /// View or modify the local XDG config settings
-    Config(ConfigArgs),
-}
-
-#[derive(ClapArgs, Debug, Default)]
-struct PlayArgs {
-    /// Path to the model directory or .mlxfn file
-    #[arg(short = 'm', long, value_name = "MODEL_PATH")]
-    model: Option<PathBuf>,
-
-    /// Path to the assets/resources directory
-    #[arg(short = 'r', long, value_name = "RESOURCES_PATH")]
-    resources: Option<String>,
-
-    /// Text style conditioning prompt
-    #[arg(short = 'p', long)]
-    prompt: Option<String>,
-
-    /// Generation temperature (scales randomness)
-    #[arg(short = 't', long)]
-    temperature: Option<f32>,
-
-    /// Top-K sampling (restricts likely choices)
-    #[arg(short = 'k', long)]
-    topk: Option<u32>,
-
-    /// Enable low-latency MIDI gate envelope
-    #[arg(short = 'g', long)]
-    midi_gate: Option<bool>,
-
-    /// CFG weight for the text/style prompt (higher = more adherent to prompt). Factory default: 3.0
-    #[arg(long)]
-    cfg_text: Option<f32>,
-
-    /// CFG weight for MIDI note conditioning. Factory default: 5.0
-    #[arg(long)]
-    cfg_notes: Option<f32>,
-
-    /// CFG weight for drum conditioning. Factory default: 1.0
-    #[arg(long)]
-    cfg_drums: Option<f32>,
-
-    /// Suppress drums entirely, independent of the style prompt
-    #[arg(long)]
-    drumless: Option<bool>,
-
-    /// Output gain in dB (0.0 = unity gain). Use --volume-db=-6.0 syntax for negative values.
-    #[arg(long, allow_hyphen_values = true)]
-    volume_db: Option<f32>,
-
-    /// Record a WAV clip of this session and exit once done (see --record-seconds, --output-dir)
-    #[arg(long)]
-    record: bool,
-
-    /// Duration in seconds to record when --record is set
-    #[arg(long, default_value_t = 10)]
-    record_seconds: u64,
-
-    /// Directory to save recorded WAV clips into (overrides config output_dir)
-    #[arg(long, value_name = "OUTPUT_DIR")]
-    output_dir: Option<String>,
-}
-
-#[derive(ClapArgs, Debug)]
-struct ConfigArgs {
-    #[command(subcommand)]
-    action: ConfigAction,
-}
-
-#[derive(Subcommand, Debug)]
-enum ConfigAction {
-    /// Show the path and contents of the configuration file
-    List,
-    
-    /// Print the absolute file path to config.toml
-    Path,
-    
-    /// Modify a specific configuration value (e.g. config set prompt \"jazz\")
-    Set {
-        /// Configuration key to modify (model, resources, prompt, temperature, topk, midi_gate,
-        /// cfg_text, cfg_notes, cfg_drums, drumless, volume_db)
-        key: String,
-        
-        /// New value for the configuration key (negative numbers OK, e.g. -6.0)
-        #[arg(allow_hyphen_values = true)]
-        value: String,
-    },
-}
 
 fn main() {
     // Initialize standard environment logger
     env_logger::init();
-    
+
     // Load config from standard XDG path
-    let mut config = load_config();
+    let config = load_config();
 
     // Parse CLI arguments
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Config(cfg_args)) => {
-            match cfg_args.action {
-                ConfigAction::Path => {
-                    println!("{}", get_config_path().display());
-                }
-                ConfigAction::List => {
-                    let path = get_config_path();
-                    println!("Config File Path: {}\n", path.display());
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        println!("{}", content);
-                    }
-                }
-                ConfigAction::Set { key, value } => {
-                    match key.as_str() {
-                        "model" => {
-                            config.model = if value.is_empty() || value == "none" { None } else { Some(value.clone()) };
-                        }
-                        "resources" => {
-                            config.resources = value.clone();
-                        }
-                        "prompt" => {
-                            config.prompt = value.clone();
-                        }
-                        "temperature" => {
-                            if let Ok(val) = value.parse::<f32>() {
-                                config.temperature = val;
-                            } else {
-                                eprintln!("❌ Error: Failed to parse temperature as float");
-                                std::process::exit(1);
-                            }
-                        }
-                        "topk" => {
-                            if let Ok(val) = value.parse::<u32>() {
-                                config.topk = val;
-                            } else {
-                                eprintln!("❌ Error: Failed to parse topk as integer");
-                                std::process::exit(1);
-                            }
-                        }
-                        "midi_gate" => {
-                            if let Ok(val) = value.parse::<bool>() {
-                                config.midi_gate = val;
-                            } else {
-                                eprintln!("❌ Error: Failed to parse midi_gate as boolean (true/false)");
-                                std::process::exit(1);
-                            }
-                        }
-                        "cfg_text" => {
-                            if let Ok(val) = value.parse::<f32>() {
-                                config.cfg_text = val;
-                            } else {
-                                eprintln!("❌ Error: Failed to parse cfg_text as float");
-                                std::process::exit(1);
-                            }
-                        }
-                        "cfg_notes" => {
-                            if let Ok(val) = value.parse::<f32>() {
-                                config.cfg_notes = val;
-                            } else {
-                                eprintln!("❌ Error: Failed to parse cfg_notes as float");
-                                std::process::exit(1);
-                            }
-                        }
-                        "cfg_drums" => {
-                            if let Ok(val) = value.parse::<f32>() {
-                                config.cfg_drums = val;
-                            } else {
-                                eprintln!("❌ Error: Failed to parse cfg_drums as float");
-                                std::process::exit(1);
-                            }
-                        }
-                        "drumless" => {
-                            if let Ok(val) = value.parse::<bool>() {
-                                config.drumless = val;
-                            } else {
-                                eprintln!("❌ Error: Failed to parse drumless as boolean (true/false)");
-                                std::process::exit(1);
-                            }
-                        }
-                        "volume_db" => {
-                            if let Ok(val) = value.parse::<f32>() {
-                                config.volume_db = val;
-                            } else {
-                                eprintln!("❌ Error: Failed to parse volume_db as float");
-                                std::process::exit(1);
-                            }
-                        }
-                        "output_dir" => {
-                            config.output_dir = value.clone();
-                        }
-                        _ => {
-                            eprintln!("❌ Error: Unknown configuration key '{}'", key);
-                            eprintln!("Valid keys: model, resources, prompt, temperature, topk, midi_gate, cfg_text, cfg_notes, cfg_drums, drumless, volume_db, output_dir");
-                            std::process::exit(1);
-                        }
-                    }
-                    save_config(&config);
-                    println!("✓ Successfully set '{}' to '{}' in config!", key, value);
-                }
-            }
-        }
-        Some(Commands::Play(play_args)) => {
-            run_player(config, play_args);
-        }
-        None => {
-            // Default to play with default arguments if no subcommand is supplied
-            run_player(config, PlayArgs::default());
-        }
+        Some(Commands::Config(cfg_args)) => cli::handle_config(config, cfg_args.action),
+        Some(Commands::Play(play_args)) => run_player(config, play_args),
+        // Default to play with default arguments if no subcommand is supplied
+        None => run_player(config, PlayArgs::default()),
     }
-}
-
-/// Expands a leading `~/` in a path string to the user's home directory.
-fn expand_tilde(path: &str) -> String {
-    if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return format!("{}/{}", home.display(), stripped);
-        }
-    }
-    path.to_string()
 }
 
 /// Creates a consistently-styled animated spinner for blocking/async loading
@@ -402,25 +56,6 @@ fn new_spinner(msg: impl Into<String>) -> indicatif::ProgressBar {
     pb.set_message(msg.into());
     pb.enable_steady_tick(std::time::Duration::from_millis(80));
     pb
-}
-
-/// Per mrt2-integration.md: the `resources/` directory (MusicCoCa +
-/// SpectroStream assets) is a sibling of the model file somewhere up the
-/// tree, not nested inside it, and at an unspecified depth (varies by how
-/// the user organized their model downloads) -- so we walk up from the
-/// model's parent directory looking for a `resources/` dir rather than
-/// hardcoding a level count.
-fn find_resources_near_model(model_path: &str) -> Option<String> {
-    let mut dir = std::path::Path::new(model_path).parent()?.to_path_buf();
-    loop {
-        let candidate = dir.join("resources");
-        if candidate.is_dir() {
-            return Some(candidate.to_string_lossy().to_string());
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
 }
 
 fn run_player(config: AppConfig, args: PlayArgs) {
@@ -495,7 +130,7 @@ fn run_player(config: AppConfig, args: PlayArgs) {
 
     // 1. Initialize the C++ RealtimeRunner via the cxx bridge:
     println!("\nInitializing C++ RealtimeRunner...");
-    let mut runner_unique = ffi::create_runner();
+    let mut runner_unique = create_runner();
 
     // 2. Load the MusicCoCa tokenizer/text-encoder/quantizer assets.
     //    REQUIRED before set_prompt() can have any effect — without this,
@@ -528,7 +163,7 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     runner_unique.set_cfg_drums(cfg_drums);
     runner_unique.set_drumless(drumless);
     runner_unique.set_volume_db(volume_db);
-    
+
     // Set ring buffer virtual capacity to 8192 samples (RingBuffer::kCapacity, the
     // physical maximum, ~170ms/4 frames at 48kHz). docs/realtime-audio.md and
     // mrt2-prompt-and-drift.md both call out that 4096 (~85ms) still allows
@@ -590,122 +225,15 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     // 5. Wrap runner in Arc to share with the cpal audio thread
     let runner = Arc::new(runner_unique);
 
-    // 5. Initialize the default audio output device using cpal
-    println!("Opening default audio output device...");
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .expect("❌ Error: No audio output device available");
-    
-    // Query supported configurations to request exactly 48000 Hz stereo
-    let supported_configs_range = device
-        .supported_output_configs()
-        .expect("❌ Error: Failed to query supported audio configurations");
-        
-    let config_format = supported_configs_range
-        .filter(|c| c.channels() == 2)
-        .find(|c| c.min_sample_rate().0 <= 48000 && c.max_sample_rate().0 >= 48000)
-        .map(|c| c.with_sample_rate(cpal::SampleRate(48000)))
-        .unwrap_or_else(|| {
-            let default_config = device.default_output_config().expect("❌ Error: Failed to get default audio output configuration");
-            println!("\n[WARNING] 48kHz stereo output not directly supported by this audio device (e.g. Sonos/Bluetooth/AirPlay).");
-            println!("          Falling back to default format ({} channels, {} Hz).", default_config.channels(), default_config.sample_rate().0);
-            println!("          This will cause a slight pitch-shift and conversion warble because the MRT2 engine");
-            println!("          runs internally at exactly 48000 Hz.");
-            println!("          -> TIP: For pristine sound, use built-in MBP speakers and set them to 48,000 Hz in Audio MIDI Setup!\n");
-            default_config
-        });
-        
-    let audio_format_line = format!("{} channels, {} Hz", config_format.channels(), config_format.sample_rate().0);
-    println!("Audio Format:  {}", audio_format_line);
+    // 6. Open the audio device and build the output stream (with resampler if needed)
+    let (stream, audio_format_line) = audio::build_output_stream(&runner);
 
-    // Audio Resampler Setup:
-    // MRT2 generates frames strictly at 48000 Hz. If the hardware device runs at a
-    // different rate (e.g. 44100 Hz on Sonos Roam or Bluetooth), we perform real-time
-    // lock-free linear resampling to prevent flat pitch shifts and playback speed drops.
-    let device_sample_rate = config_format.sample_rate().0 as f64;
-    let ratio = 48000.0 / device_sample_rate;
-    let is_resampling = (device_sample_rate - 48000.0).abs() > 5.0; // allow small tolerance
-
-    // Resampler boundary states captured mutably by the audio thread closure
-    let mut src_accum = 0.0f64;
-    let mut last_sample_l = 0.0f32;
-    let mut last_sample_r = 0.0f32;
-
-    // We pull stereo float samples from the runner and interleave them into the cpal output stream
-    let runner_clone = Arc::clone(&runner);
-    let stream = device
-        .build_output_stream(
-            &config_format.into(),
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let num_frames = data.len() / 2;
-                
-                if !is_resampling {
-                    // Fast native path (no resampling overhead)
-                    let mut left = vec![0.0f32; num_frames];
-                    let mut right = vec![0.0f32; num_frames];
-                    runner_clone.read_audio_stereo(&mut left, &mut right);
-                    for (i, frame) in data.chunks_exact_mut(2).enumerate() {
-                        frame[0] = left[i];
-                        frame[1] = right[i];
-                    }
-                } else {
-                    // High-fidelity, lock-free real-time linear resampler.
-                    // Boundary-safe: keeps memory of the very last sample of the prior
-                    // block to interpolate cleanly across buffer boundaries, preventing
-                    // clicks and pops.
-                    let next_src_pos = src_accum + num_frames as f64 * ratio;
-                    let consumed_inputs = next_src_pos.floor() as usize;
-                    
-                    let mut left = vec![0.0f32; consumed_inputs];
-                    let mut right = vec![0.0f32; consumed_inputs];
-                    
-                    if consumed_inputs > 0 {
-                        runner_clone.read_audio_stereo(&mut left, &mut right);
-                    }
-                    
-                    // Input buffers of size consumed_inputs + 1 to hold the saved last sample at index 0
-                    let mut input_l = vec![0.0f32; consumed_inputs + 1];
-                    let mut input_r = vec![0.0f32; consumed_inputs + 1];
-                    
-                    input_l[0] = last_sample_l;
-                    input_r[0] = last_sample_r;
-                    
-                    if consumed_inputs > 0 {
-                        input_l[1..=consumed_inputs].copy_from_slice(&left);
-                        input_r[1..=consumed_inputs].copy_from_slice(&right);
-                        
-                        last_sample_l = left[consumed_inputs - 1];
-                        last_sample_r = right[consumed_inputs - 1];
-                    }
-                    
-                    // Resample and interleave directly into the hardware output buffer
-                    for i in 0..num_frames {
-                        let src_pos = src_accum + i as f64 * ratio;
-                        let idx = src_pos.floor() as usize;
-                        let frac = (src_pos - idx as f64) as f32;
-                        
-                        let out_l = input_l[idx] * (1.0 - frac) + input_l[idx + 1] * frac;
-                        let out_r = input_r[idx] * (1.0 - frac) + input_r[idx + 1] * frac;
-                        
-                        data[i * 2] = out_l;
-                        data[i * 2 + 1] = out_r;
-                    }
-                    
-                    // Store fractional accumulator offset for the next callback block
-                    src_accum = next_src_pos - consumed_inputs as f64;
-                }
-            },
-            |err| eprintln!("❌ Audio stream error: {}", err),
-            None
-        )
-        .expect("❌ Error: Failed to build CPAL audio output stream");
-
-    // 6. Start the real-time audio playback stream
+    // 7. Start the real-time audio playback stream
+    use cpal::traits::StreamTrait;
     stream.play().expect("❌ Error: Failed to start CPAL audio stream");
     println!("✓ Hardware audio output stream started!");
 
-    // 7. Start the C++ real-time inference thread
+    // 8. Start the C++ real-time inference thread
     println!("Starting real-time playback pipeline...");
     runner.toggle_play(true);
 
@@ -715,68 +243,20 @@ fn run_player(config: AppConfig, args: PlayArgs) {
     // model load or the CPAL device opening before this explicit reset.
     runner.reset_dropped_frames();
 
-    // 8. If --record was requested, capture a fixed-length clip and exit.
-    // Note: this pulls from the engine's internal recording buffer, which is
-    // populated at MRT2's native 48kHz float PCM directly from the C++ side --
-    // independent of whatever sample rate our CPAL live-listening output
-    // fell back to (see the 44.1kHz Sonos/Bluetooth warning above). Recorded
-    // clips are always pristine native-rate audio regardless of that.
+    // 9. If --record was requested, capture a fixed-length clip and exit.
+    //    Pulls from the engine's internal recording buffer at native 48kHz,
+    //    independent of whatever rate the live CPAL output fell back to.
     if record {
-        std::fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
-            eprintln!("❌ Error: Failed to create output directory {}: {}", output_dir, e);
-            std::process::exit(1);
-        });
-
-        println!("\n[INFO] Recording {} seconds...", record_seconds);
-        runner.start_recording();
-        std::thread::sleep(std::time::Duration::from_secs(record_seconds));
-        runner.stop_recording();
-
-        let sample_count = runner.get_recorded_sample_count();
-        if sample_count == 0 {
-            eprintln!("❌ Error: No audio was captured (0 samples recorded).");
-            std::process::exit(1);
-        }
-
-        let mut left = vec![0.0f32; sample_count];
-        let mut right = vec![0.0f32; sample_count];
-        runner.get_recorded_audio(0, &mut left, &mut right);
-
-        let filename = format!("recording-{}.wav", chrono::Local::now().format("%Y%m%d-%H%M%S"));
-        let out_path = std::path::Path::new(&output_dir).join(&filename);
-
-        let spec = hound::WavSpec {
-            channels: 2,
-            sample_rate: 48000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(&out_path, spec).unwrap_or_else(|e| {
-            eprintln!("❌ Error: Failed to create WAV file {}: {}", out_path.display(), e);
-            std::process::exit(1);
-        });
-        for i in 0..sample_count {
-            let l_i16 = (left[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-            let r_i16 = (right[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-            writer.write_sample(l_i16).ok();
-            writer.write_sample(r_i16).ok();
-        }
-        writer.finalize().unwrap_or_else(|e| {
-            eprintln!("❌ Error: Failed to finalize WAV file: {}", e);
-            std::process::exit(1);
-        });
-
-        println!("✓ Recorded {:.1}s ({} samples) to: {}", 
-            sample_count as f64 / 48000.0, sample_count, out_path.display());
+        audio::record_to_wav(&runner, &output_dir, record_seconds);
         return;
     }
 
-    // Use TUI dashboard when stdout is an interactive terminal.
-    // Fall back to the plain scrolling metrics log otherwise (piped output,
-    // CI, log files) so we never corrupt non-terminal output streams.
+    // 10. Use TUI dashboard when stdout is an interactive terminal.
+    //     Fall back to the plain scrolling metrics log otherwise (piped output,
+    //     CI, log files) so we never corrupt non-terminal output streams.
     use std::io::IsTerminal;
     if std::io::stdout().is_terminal() {
-        run_tui_dashboard(&runner, effective_config, &model_path, audio_format_line);
+        tui::run_tui_dashboard(&runner, effective_config, &model_path, audio_format_line);
     } else {
         println!("\n[INFO] Playback running. Press Ctrl+C to stop.");
         let mut count = 0;
@@ -792,401 +272,4 @@ fn run_player(config: AppConfig, args: PlayArgs) {
             count += 1;
         }
     }
-}
-
-/// Helper function to create a centered rectangular area for TUI popup modals.
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-fn run_tui_dashboard(
-    runner: &Arc<cxx::UniquePtr<ffi::RealtimeRunnerBridge>>,
-    base_config: AppConfig,
-    model_path: &Option<String>,
-    audio_format: String,
-) {
-    // Set up terminal
-    enable_raw_mode().expect("❌ Failed to enable raw mode");
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen).expect("❌ Failed to enter alternate screen");
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).expect("❌ Failed to create terminal");
-
-    // Dynamic history ring for sparkline (will be resized on draw ticks to match terminal columns)
-    let mut trans_history: VecDeque<u64> = VecDeque::with_capacity(120);
-    let session_start = std::time::Instant::now();
-
-    let mut last_trans_ms = 0.0f64;
-    let mut last_dropped: u64 = 0;
-    let mut resets: u32 = 0;
-
-    // Mutably track live-adjusted parameters so they reflect in the TUI in real
-    // time. Initialized from the effective (CLI-over-config-merged) session
-    // settings, so a --volume-db / --midi-gate passed on the CLI is reflected
-    // in the initial TUI display and in what an explicit save would persist.
-    let mut cur_temp = base_config.temperature;
-    let mut cur_topk = base_config.topk;
-    let mut cur_cfg_text = base_config.cfg_text;
-    let mut cur_cfg_drums = base_config.cfg_drums;
-    let mut cur_volume_db = base_config.volume_db;
-    let mut cur_midi_gate = base_config.midi_gate;
-    let mut current_prompt = base_config.prompt.clone();
-
-    // Input mode for changing style prompt mid-playback
-    let mut input_mode = false;
-    let mut input_string = String::new();
-
-    // Transient status message shown in the title bar (e.g. after saving config)
-    let mut status_message: Option<(String, std::time::Instant)> = None;
-
-    let model_display = model_path
-        .as_deref()
-        .and_then(|p| std::path::Path::new(p).file_stem())
-        .and_then(|s| s.to_str())
-        .unwrap_or("none")
-        .to_string();
-
-    let draw_tick = std::time::Duration::from_millis(33); // ~30 Hz
-    let metrics_tick = std::time::Duration::from_millis(200); // 5 Hz
-    let mut last_metrics = std::time::Instant::now();
-
-    let result = (|| -> std::io::Result<()> {
-        loop {
-            // Query dynamic terminal width to adjust sparkline history size
-            let max_history_size = if let Ok(sz) = terminal.size() {
-                // The sparkline block width minus borders
-                (sz.width as usize).saturating_sub(2).max(10)
-            } else {
-                60
-            };
-
-            // Keep history trimmed to the dynamic column width
-            while trans_history.len() > max_history_size {
-                trans_history.pop_front();
-            }
-
-            // Poll crossterm events (non-blocking)
-            if event::poll(draw_tick)? {
-                if let Event::Key(key) = event::read()? {
-                    if input_mode {
-                        match key.code {
-                            KeyCode::Enter => {
-                                if !input_string.trim().is_empty() {
-                                    current_prompt = input_string.clone();
-                                    runner.set_prompt(&current_prompt);
-                                    runner.toggle_play(true); // Immediate reset and re-anchor!
-                                    runner.reset_dropped_frames();
-                                    resets += 1;
-                                }
-                                input_mode = false;
-                                input_string.clear();
-                            }
-                            KeyCode::Esc => {
-                                input_mode = false;
-                                input_string.clear();
-                            }
-                            KeyCode::Backspace => {
-                                input_string.pop();
-                            }
-                            KeyCode::Char(c) => {
-                                if input_string.len() < 200 {
-                                    input_string.push(c);
-                                }
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        match key.code {
-                            // Lifecycle
-                            KeyCode::Char('q') | KeyCode::Esc => break,
-                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                            KeyCode::Char('r') => {
-                                runner.toggle_play(true);
-                                runner.reset_dropped_frames();
-                                resets += 1;
-                            }
-                            
-                            // Enter prompt input mode
-                            KeyCode::Char('/') | KeyCode::Char('p') => {
-                                input_mode = true;
-                                input_string = current_prompt.clone();
-                            }
-                            
-                            // Interactive Parameter Adjustments (steers C++ runner atomically!)
-                            KeyCode::Char('[') => {
-                                cur_cfg_text = (cur_cfg_text - 0.5).max(1.0);
-                                runner.set_cfg_text(cur_cfg_text);
-                            }
-                            KeyCode::Char(']') => {
-                                cur_cfg_text = (cur_cfg_text + 0.5).min(10.0);
-                                runner.set_cfg_text(cur_cfg_text);
-                            }
-                            KeyCode::Char('-') => {
-                                cur_temp = (cur_temp - 0.1).max(0.1);
-                                runner.set_temperature(cur_temp);
-                            }
-                            KeyCode::Char('+') | KeyCode::Char('=') => {
-                                cur_temp = (cur_temp + 0.1).min(2.5);
-                                runner.set_temperature(cur_temp);
-                            }
-                            KeyCode::Char(',') | KeyCode::Char('<') => {
-                                cur_topk = cur_topk.saturating_sub(5).max(5);
-                                runner.set_top_k(cur_topk);
-                            }
-                            KeyCode::Char('.') | KeyCode::Char('>') => {
-                                cur_topk = (cur_topk + 5).min(200);
-                                runner.set_top_k(cur_topk);
-                            }
-                            KeyCode::Char('d') => {
-                                cur_cfg_drums = (cur_cfg_drums - 0.5).max(0.0);
-                                runner.set_cfg_drums(cur_cfg_drums);
-                            }
-                            KeyCode::Char('f') => {
-                                cur_cfg_drums = (cur_cfg_drums + 0.5).min(10.0);
-                                runner.set_cfg_drums(cur_cfg_drums);
-                            }
-                            KeyCode::Char('v') => {
-                                cur_volume_db = (cur_volume_db - 2.0).max(-60.0);
-                                runner.set_volume_db(cur_volume_db);
-                            }
-                            KeyCode::Char('b') => {
-                                cur_volume_db = (cur_volume_db + 2.0).min(12.0);
-                                runner.set_volume_db(cur_volume_db);
-                            }
-                            KeyCode::Char('g') => {
-                                cur_midi_gate = !cur_midi_gate;
-                                runner.set_midi_gate(cur_midi_gate);
-                            }
-                            // Explicitly persist the current live params to config.toml.
-                            // Preserves the non-TUI-adjustable fields (model,
-                            // resources, output_dir, cfg_notes, drumless) from
-                            // the effective session config.
-                            KeyCode::Char('S') => {
-                                let mut to_save = base_config.clone();
-                                to_save.prompt = current_prompt.clone();
-                                to_save.temperature = cur_temp;
-                                to_save.topk = cur_topk;
-                                to_save.cfg_text = cur_cfg_text;
-                                to_save.cfg_drums = cur_cfg_drums;
-                                to_save.volume_db = cur_volume_db;
-                                to_save.midi_gate = cur_midi_gate;
-                                save_config(&to_save);
-                                status_message = Some((
-                                    "✓ Saved current parameters to config.toml".to_string(),
-                                    std::time::Instant::now(),
-                                ));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            // Refresh metrics at 5 Hz (not every draw tick -- read_metrics is a JSON alloc)
-            if last_metrics.elapsed() >= metrics_tick {
-                last_metrics = std::time::Instant::now();
-                let metrics_json = runner.read_metrics();
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&metrics_json) {
-                    last_trans_ms = val.get("transformer_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    last_dropped = val.get("dropped_frames").and_then(|v| v.as_u64()).unwrap_or(0);
-                }
-                let sparkval = last_trans_ms.round() as u64;
-                trans_history.push_back(sparkval);
-                if trans_history.len() > max_history_size {
-                    trans_history.pop_front();
-                }
-            }
-
-            // Draw frame
-            let uptime = session_start.elapsed().as_secs();
-            let trans_ms = last_trans_ms;
-            let dropped = last_dropped;
-            let spark_data: Vec<u64> = trans_history.iter().copied().collect();
-            let resets_count = resets;
-            let prompt_ref = current_prompt.as_str();
-            let model_ref = model_display.as_str();
-            let audio_ref = audio_format.as_str();
-
-            // Traffic-light color for transformer latency vs 40ms budget
-            let latency_color = if trans_ms < 30.0 {
-                Color::Green
-            } else if trans_ms < 40.0 {
-                Color::Yellow
-            } else {
-                Color::Red
-            };
-
-            // Gauge ratio: how much of the 40ms budget we're using (capped at 100%)
-            let budget_ratio = (trans_ms / 40.0).clamp(0.0, 1.0);
-
-            // Transient status message (e.g. save confirmation), shown for ~3s in the title bar
-            let title_text = match &status_message {
-                Some((msg, at)) if at.elapsed() < std::time::Duration::from_secs(3) => {
-                    format!(" Magenta RealTime 2 — Rust Player    [{}] ", msg)
-                }
-                _ => " Magenta RealTime 2 — Rust Player ".to_string(),
-            };
-
-            terminal.draw(|f| {
-                let area = f.area();
-                let rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(7),  // session info
-                        Constraint::Length(4),  // budget gauge
-                        Constraint::Length(8),  // sparkline
-                        Constraint::Min(0),     // spacer
-                        Constraint::Length(6),  // keyboard control help panel
-                    ])
-                    .split(area);
-
-                // ── Session info panel ──────────────────────────────────────
-                let info_lines = vec![
-                    Line::from(vec![
-                        Span::styled("  Model    ", Style::default().add_modifier(Modifier::BOLD)),
-                        Span::raw(model_ref),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("  Prompt   ", Style::default().add_modifier(Modifier::BOLD)),
-                        Span::raw(format!("\"{}\"", prompt_ref)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("  Tuning   ", Style::default().add_modifier(Modifier::BOLD)),
-                        Span::raw(format!("PromptStrength: {:.1}  Temp: {:.1}  TopK: {}  DrumsCFG: {:.1}  MidiGate: {}",
-                            cur_cfg_text, cur_temp, cur_topk, cur_cfg_drums, if cur_midi_gate { "Enabled" } else { "Disabled" })),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("  Output   ", Style::default().add_modifier(Modifier::BOLD)),
-                        Span::raw(format!("Volume: {:.1} dB  (Device: {})", cur_volume_db, audio_ref)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("  Uptime   ", Style::default().add_modifier(Modifier::BOLD)),
-                        Span::raw(format!("{:02}:{:02}:{:02}  resets: {}",
-                            uptime / 3600, (uptime % 3600) / 60, uptime % 60, resets_count)),
-                    ]),
-                ];
-                let info = Paragraph::new(info_lines)
-                    .block(Block::default()
-                        .borders(Borders::ALL)
-                        .title(title_text.clone())
-                        .title_style(Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)))
-                    .wrap(Wrap { trim: false });
-                f.render_widget(info, rows[0]);
-
-                // ── Budget gauge ────────────────────────────────────────────
-                let gauge_label = format!(
-                    "Transformer  {:.1} ms  /  40.0 ms budget  ({:.0}%)   dropped frames: {}",
-                    trans_ms, budget_ratio * 100.0, dropped
-                );
-                let gauge = Gauge::default()
-                    .block(Block::default().borders(Borders::ALL).title(" Frame Budget "))
-                    .gauge_style(Style::default().fg(latency_color))
-                    .ratio(budget_ratio)
-                    .label(gauge_label);
-                f.render_widget(gauge, rows[1]);
-
-                // ── Sparkline ───────────────────────────────────────────────
-                let spark_label = format!(" Transformer ms (last {} samples, full width) ", max_history_size);
-                let spark = Sparkline::default()
-                    .block(Block::default()
-                        .borders(Borders::ALL)
-                        .title(spark_label))
-                    .style(Style::default().fg(latency_color))
-                    .data(&spark_data);
-                f.render_widget(spark, rows[2]);
-
-                // ── Key help bar ────────────────────────────────────────────
-                let help_lines = vec![
-                    Line::from(vec![
-                        Span::styled("  [ / ] ", Style::default().fg(Color::Yellow)),
-                        Span::raw("Prompt Strength  "),
-                        Span::styled("  - / + ", Style::default().fg(Color::Yellow)),
-                        Span::raw("Temp  "),
-                        Span::styled("  , / . ", Style::default().fg(Color::Yellow)),
-                        Span::raw("TopK  "),
-                        Span::styled("  d / f ", Style::default().fg(Color::Yellow)),
-                        Span::raw("Drums CFG  "),
-                        Span::styled("  v / b ", Style::default().fg(Color::Yellow)),
-                        Span::raw("Volume"),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("  p / / ", Style::default().fg(Color::Yellow)),
-                        Span::raw("Edit Prompt Mid-play  "),
-                        Span::styled("  g     ", Style::default().fg(Color::Yellow)),
-                        Span::raw("Toggle MIDI Gate  "),
-                        Span::styled("  r     ", Style::default().fg(Color::Yellow)),
-                        Span::raw("Reset Audio Context (re-anchors to prompt)"),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("  S     ", Style::default().fg(Color::Green)),
-                        Span::raw("Save current params to config    "),
-                        Span::styled("  q/ESC ", Style::default().fg(Color::Red)),
-                        Span::raw("Quit Player"),
-                    ]),
-                ];
-                let help = Paragraph::new(help_lines)
-                    .block(Block::default().borders(Borders::ALL).title(" Interactive Playback Controls "));
-                f.render_widget(help, rows[4]);
-
-                // ── Floating popup input box (drawn only in input mode) ────
-                if input_mode {
-                    let popup_area = centered_rect(65, 20, area);
-                    let popup_block = Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Edit Style Prompt ")
-                        .title_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-                    let popup_text = vec![
-                        Line::from(vec![
-                            Span::styled("Type a new prompt and press ", Style::default()),
-                            Span::styled("Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                            Span::styled(" to apply & reset context, or ", Style::default()),
-                            Span::styled("ESC", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                            Span::styled(" to cancel.", Style::default()),
-                        ]),
-                        Line::from(""),
-                        Line::from(vec![
-                            Span::styled("> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                            Span::raw(&input_string),
-                        ]),
-                    ];
-                    let popup = Paragraph::new(popup_text)
-                        .block(popup_block)
-                        .wrap(Wrap { trim: true });
-                    
-                    f.render_widget(Clear, popup_area); // Clears background area
-                    f.render_widget(popup, popup_area);
-                }
-            })?;
-        }
-        Ok(())
-    })();
-
-    // Always restore the terminal, even on panic/error
-    let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
-
-    if let Err(e) = result {
-        eprintln!("TUI error: {}", e);
-    }
-
-    println!("Playback stopped.");
 }
